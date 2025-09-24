@@ -80,12 +80,7 @@ class UnifiedPKPDTrainer:
         else:
             encoder_name = self.config.encoder
         
-        # Unified structure: {run_name}/{mode}/{encoder}/s{random_state}/
-        if hasattr(self.config, 'run_name') and self.config.run_name:
-            self.model_save_directory = Path(self.config.output_dir) / self.config.run_name / self.config.mode / encoder_name / f"s{self.config.random_state}"
-        else:
-            # Fallback to old structure
-            self.model_save_directory = Path(self.config.output_dir) / "models" / self.config.mode / encoder_name / f"s{self.config.random_state}"
+        self.model_save_directory = Path(self.config.output_dir) / "models" / self.config.mode / encoder_name / f"s{self.config.random_state}"
         self.model_save_directory.mkdir(parents=True, exist_ok=True)
     
     def _setup_components(self):
@@ -96,9 +91,9 @@ class UnifiedPKPDTrainer:
             self.logger.info(f"Data augmentation enabled: {self.data_augmentation.aug_method}")
         
         # Contrastive learning
-        if self.config.use_contrastive_pretraining:
+        if self.config.lambda_contrast > 0:
             self.contrastive_learning = create_pkpd_contrastive_learning(self.config)
-            self.logger.info(f"PK/PD Contrastive Learning enabled - Augmentation: {self.config.aug_method}")
+            self.logger.info(f"PK/PD Contrastive Learning enabled - Augmentation: {self.config.augmentation_type}")
         else:
             self.contrastive_learning = None
         
@@ -128,21 +123,16 @@ class UnifiedPKPDTrainer:
         
         # Contrastive pretraining phase
         pretraining_results = None
-        if getattr(self.config, 'use_contrastive_pretraining', False):
+        if self.config.lambda_contrast > 0 and getattr(self.config, 'use_contrastive_pretraining', False):
             self.logger.info("Starting Contrastive Pretraining Phase...")
-            pretraining_epochs = getattr(self.config, 'pretraining_epochs', 50)
-            pretraining_patience = getattr(self.config, 'pretraining_patience', 20)
-            pretraining_results = self.pretraining.contrastive_pretraining(epochs=pretraining_epochs, patience=pretraining_patience)
+            pretraining_epochs = getattr(self.config, 'contrastive_pretraining_epochs', 50)
+            pretraining_results = self.pretraining.contrastive_pretraining(epochs=pretraining_epochs)
             
             # Load pretrained model for supervised training
             self.pretraining.load_pretrained_model()
             self._pretraining_completed = True  # Mark pretraining as completed
             self.logger.info("Pretrained model loaded, starting supervised training...")
-
-        # Setup supervised training augmentation
-        if getattr(self.config, 'use_aug_supervised', False) and self.data_augmentation.aug_method:
-            self.logger.info(f"Supervised training augmentation enabled: {self.data_augmentation.aug_method}")
-
+        
         # Main supervised training
         if self.mode == "separate":
             return self._train_separate_mode(pretraining_results)
@@ -308,6 +298,9 @@ class UnifiedPKPDTrainer:
             'pd_mse': 0.0, 'pd_rmse': 0.0, 'pd_mae': 0.0, 'pd_r2': 0.0
         }
         
+        # Mixed precision settings
+        scaler = torch.cuda.amp.GradScaler() if self.device.type == 'cuda' else None
+        
         # Select mode-specific data loaders
         train_loaders = self._get_train_loaders()
         pk_loader, pd_loader = train_loaders
@@ -315,113 +308,52 @@ class UnifiedPKPDTrainer:
         # Process PK and PD batches independently
         pk_batches = list(pk_loader)
         pd_batches = list(pd_loader)
-
-        pk_predictions = []
-        pk_targets = []
+        
         # Process all PK batches
         for batch_pk in pk_batches:
             self.optimizer.zero_grad()
             batch_pk = self._to_device(batch_pk)
-
-            loss_dict = self.loss_computation.compute_loss(batch_pk, None, self.mode, is_training=True)
-            loss_dict['total'].backward()
-            self.optimizer.step()
+            
+            if scaler is not None:
+                with torch.cuda.amp.autocast():
+                    loss_dict = self.loss_computation.compute_loss(batch_pk, None, self.mode)
+                scaler.scale(loss_dict['total']).backward()
+                scaler.step(self.optimizer)
+                scaler.update()
+            else:
+                loss_dict = self.loss_computation.compute_loss(batch_pk, None, self.mode)
+                loss_dict['total'].backward()
+                self.optimizer.step()
             
             total_loss += loss_dict['total'].item()
             pk_loss += loss_dict.get('pk', 0.0)
-            # Store predictions and targets for R² calculation
-            if isinstance(batch_pk, (list, tuple)):
-                pk_target = batch_pk[1]
-            else:
-                pk_target = batch_pk['y']
-            
-            # Convert batch to proper format
-            if isinstance(batch_pk, (list, tuple)):
-                batch_dict = {'x': batch_pk[0], 'y': batch_pk[1]}
-            else:
-                batch_dict = batch_pk
-            
-            if self.config.use_mc_dropout:
-                pk_results = self.model.predict_with_uncertainty({'pk': batch_dict})
-            else:
-                pk_results = self.model({'pk': batch_dict})
-            pk_pred = pk_results['pk']['pred']
-            pk_predictions.append(pk_pred.detach().cpu())
-            pk_targets.append(pk_target.detach().cpu())
-            
             num_batches += 1
-
-        # Calculate actual metrics
-        pk_mse = pk_loss / num_batches
-        pk_rmse = np.sqrt(pk_mse.item() if hasattr(pk_mse, 'item') else pk_mse)
-        pk_mae = pk_mse  # Approximation
         
-        # Calculate R² using _reg_metrics from heads.py
-        if pk_predictions and pk_targets:
-            pk_pred_flat = torch.cat(pk_predictions).squeeze()
-            pk_target_flat = torch.cat(pk_targets).squeeze()
-            pk_metrics = _reg_metrics(pk_pred_flat, pk_target_flat)
-            pk_r2 = pk_metrics['r2']
-        else:
-            pk_r2 = 0.0
-
-
-        pd_predictions = []
-        pd_targets = []
-
         # Process all PD batches
         for batch_pd in pd_batches:
             self.optimizer.zero_grad()
             batch_pd = self._to_device(batch_pd)
             
-            loss_dict = self.loss_computation.compute_loss(None, batch_pd, self.mode, is_training=True)
-            loss_dict['total'].backward()
-            self.optimizer.step()
-        
+            if scaler is not None:
+                with torch.cuda.amp.autocast():
+                    loss_dict = self.loss_computation.compute_loss(None, batch_pd, self.mode)
+                scaler.scale(loss_dict['total']).backward()
+                scaler.step(self.optimizer)
+                scaler.update()
+            else:
+                loss_dict = self.loss_computation.compute_loss(None, batch_pd, self.mode)
+                loss_dict['total'].backward()
+                self.optimizer.step()
+            
             total_loss += loss_dict['total'].item()
             pd_loss += loss_dict.get('pd', 0.0)
-            # Store predictions and targets for R² calculation
-            if isinstance(batch_pd, (list, tuple)):
-                pd_target = batch_pd[1]
-            else:
-                pd_target = batch_pd['y']
-                
-            # Convert batch to proper format
-            if isinstance(batch_pd, (list, tuple)):
-                batch_dict = {'x': batch_pd[0], 'y': batch_pd[1]}
-            else:
-                batch_dict = batch_pd
-                
-            if self.config.use_mc_dropout:
-                pd_results = self.model.predict_with_uncertainty({'pd': batch_dict})
-            else:
-                pd_results = self.model({'pd': batch_dict}) 
-            pd_pred = pd_results['pd']['pred']
-            pd_predictions.append(pd_pred.detach().cpu())
-            pd_targets.append(pd_target.detach().cpu())
-                
             num_batches += 1
-                
-        # Calculate actual metrics
-        pd_mse = pd_loss / num_batches
-        pd_rmse = np.sqrt(pd_mse.item() if hasattr(pd_mse, 'item') else pd_mse)
-        pd_mae = pd_mse  # Approximation
         
-        # Calculate R² using _reg_metrics from heads.py
-        if pd_predictions and pd_targets:
-            pd_pred_flat = torch.cat(pd_predictions).squeeze()
-            pd_target_flat = torch.cat(pd_targets).squeeze()
-            pd_metrics = _reg_metrics(pd_pred_flat, pd_target_flat)
-            pd_r2 = pd_metrics['r2']
-        else:
-            pd_r2 = 0.0
         # Calculate average
         result = {
             'total_loss': total_loss / num_batches,
             'pk_loss': pk_loss / num_batches,
-            'pd_loss': pd_loss / num_batches,
-            'pk_mse': pk_mse, 'pk_rmse': pk_rmse, 'pk_mae': pk_mae, 'pk_r2': float(pk_r2),
-            'pd_mse': pd_mse, 'pd_rmse': pd_rmse, 'pd_mae': pd_mae, 'pd_r2': float(pd_r2),
+            'pd_loss': pd_loss / num_batches
         }
         
         return result
@@ -440,68 +372,34 @@ class UnifiedPKPDTrainer:
             'pd_mse': 0.0, 'pd_rmse': 0.0, 'pd_mae': 0.0, 'pd_r2': 0.0
         }
         
-
+        # Mixed precision settings
+        scaler = torch.cuda.amp.GradScaler() if self.device.type == 'cuda' else None
+        
         # Phase 1: Train PK model
         self.logger.info("=== Phase 1: Training PK Model ===")
         pk_batch_count = 0
-        # For R² calculation (using evaluation.py method)
-        pk_predictions = []
-        pk_targets = []
-        
         for batch_pk in self.data_loaders['train_pk']:
             self.optimizer.zero_grad()
             batch_pk = self._to_device(batch_pk)
             
-            loss_dict = self.loss_computation.compute_loss(batch_pk, None, self.mode, is_training=True)
-            loss_dict['total'].backward()
-            self.optimizer.step()
-        
+            if scaler is not None:
+                with torch.cuda.amp.autocast():
+                    loss_dict = self.loss_computation.compute_loss(batch_pk, None, self.mode)
+                scaler.scale(loss_dict['total']).backward()
+                scaler.step(self.optimizer)
+                scaler.update()
+            else:
+                loss_dict = self.loss_computation.compute_loss(batch_pk, None, self.mode)
+                loss_dict['total'].backward()
+                self.optimizer.step()
+            
             total_loss += loss_dict['total'].item()
             pk_loss += loss_dict.get('pk', torch.tensor(0.0)).item()
-
-            # Store predictions and targets for R² calculation
-            if isinstance(batch_pk, (list, tuple)):
-                pk_target = batch_pk[1]
-            else:
-                pk_target = batch_pk['y']
-            
-            # Convert batch to proper format
-            if isinstance(batch_pk, (list, tuple)):
-                batch_dict = {'x': batch_pk[0], 'y': batch_pk[1]}
-            else:
-                batch_dict = batch_pk
-            
-            if self.config.use_mc_dropout:
-                pk_results = self.model.predict_with_uncertainty({'pk': batch_dict})
-            else:
-                pk_results = self.model({'pk': batch_dict})
-            pk_pred = pk_results['pk']['pred']
-            pk_predictions.append(pk_pred.detach().cpu())
-            pk_targets.append(pk_target.detach().cpu())
-
             num_batches += 1
             pk_batch_count += 1
         
-        # Calculate actual metrics
-        pk_mse = pk_loss / num_batches
-        pk_rmse = np.sqrt(pk_mse.item() if hasattr(pk_mse, 'item') else pk_mse)
-        pk_mae = pk_mse  # Approximation
-        
-        # Calculate R² using _reg_metrics from heads.py
-        if pk_predictions and pk_targets:
-            pk_pred_flat = torch.cat(pk_predictions).squeeze()
-            pk_target_flat = torch.cat(pk_targets).squeeze()
-            pk_metrics = _reg_metrics(pk_pred_flat, pk_target_flat)
-            pk_r2 = pk_metrics['r2']
-        else:
-            pk_r2 = 0.0
-        
         self.logger.info(f"PK training completed - Processed {pk_batch_count} batches")
         
-
-        # For R² calculation (using evaluation.py method)
-        pd_predictions = []
-        pd_targets = []
         # Phase 2: Train PD model
         self.logger.info("=== Phase 2: Training PD Model ===")
         pd_batch_count = 0
@@ -511,64 +409,27 @@ class UnifiedPKPDTrainer:
             
             if scaler is not None:
                 with torch.cuda.amp.autocast():
-                    loss_dict = self.loss_computation.compute_loss(None, batch_pd, self.mode, is_training=True)
+                    loss_dict = self.loss_computation.compute_loss(None, batch_pd, self.mode)
                 scaler.scale(loss_dict['total']).backward()
                 scaler.step(self.optimizer)
                 scaler.update()
             else:
-                loss_dict = self.loss_computation.compute_loss(None, batch_pd, self.mode, is_training=True)
+                loss_dict = self.loss_computation.compute_loss(None, batch_pd, self.mode)
                 loss_dict['total'].backward()
                 self.optimizer.step()
             
             total_loss += loss_dict['total'].item()
             pd_loss += loss_dict.get('pd', torch.tensor(0.0)).item()
-
-            # Store predictions and targets for R² calculation
-            if isinstance(batch_pd, (list, tuple)):
-                pd_target = batch_pd[1]
-            else:
-                pd_target = batch_pd['y']
-                
-            # Convert batch to proper format
-            if isinstance(batch_pd, (list, tuple)):
-                batch_dict = {'x': batch_pd[0], 'y': batch_pd[1]}
-            else:
-                batch_dict = batch_pd
-                
-            if self.config.use_mc_dropout:
-                pd_results = self.model.predict_with_uncertainty({'pd': batch_dict})
-            else:
-                pd_results = self.model({'pd': batch_dict})
-            pd_pred = pd_results['pd']['pred']
-            pd_predictions.append(pd_pred.detach().cpu())
-            pd_targets.append(pd_target.detach().cpu())
-
             num_batches += 1
             pd_batch_count += 1
         
         self.logger.info(f"PD training completed - Processed {pd_batch_count} batches")
-        
-        # Calculate actual metrics
-        pd_mse = pd_loss / num_batches
-        pd_rmse = np.sqrt(pd_mse.item() if hasattr(pd_mse, 'item') else pd_mse)
-        pd_mae = pd_mse  # Approximation
-        
-        # Calculate R² using _reg_metrics from heads.py
-        if pd_predictions and pd_targets:
-            pd_pred_flat = torch.cat(pd_predictions).squeeze()
-            pd_target_flat = torch.cat(pd_targets).squeeze()
-            pd_metrics = _reg_metrics(pd_pred_flat, pd_target_flat)
-            pd_r2 = pd_metrics['r2']
-        else:
-            pd_r2 = 0.0
         
         # Average metrics
         avg_metrics = {
             'total_loss': total_loss / num_batches,
             'pk_loss': pk_loss / num_batches,
             'pd_loss': pd_loss / num_batches,
-            'pk_mse': pk_mse, 'pk_rmse': pk_rmse, 'pk_mae': pk_mae, 'pk_r2': float(pk_r2),
-            'pd_mse': pd_mse, 'pd_rmse': pd_rmse, 'pd_mae': pd_mae, 'pd_r2': float(pd_r2),
         }
         
         return avg_metrics
@@ -579,59 +440,35 @@ class UnifiedPKPDTrainer:
         pk_loss = 0.0
         num_batches = 0
         
-        # For R² calculation (using evaluation.py method)
-        pk_predictions = []
-        pk_targets = []
+        # Metrics accumulation
+        metrics_sum = {
+            'pk_mse': 0.0, 'pk_rmse': 0.0, 'pk_mae': 0.0, 'pk_r2': 0.0
+        }
+        
+        # Mixed precision settings
+        scaler = torch.cuda.amp.GradScaler() if self.device.type == 'cuda' else None
         
         for batch_pk in self.data_loaders['train_pk']:
             self.optimizer.zero_grad()
             batch_pk = self._to_device(batch_pk)
-
-            loss_dict = self.loss_computation.compute_loss(batch_pk, None, self.mode, is_training=True)
-            loss_dict['total'].backward()
-            self.optimizer.step()
+            
+            if scaler is not None:
+                with torch.cuda.amp.autocast():
+                    loss_dict = self.loss_computation.compute_loss(batch_pk, None, self.mode)
+                scaler.scale(loss_dict['total']).backward()
+                scaler.step(self.optimizer)
+                scaler.update()
+            else:
+                loss_dict = self.loss_computation.compute_loss(batch_pk, None, self.mode)
+                loss_dict['total'].backward()
+                self.optimizer.step()
             
             pk_loss += loss_dict.get('pk', torch.tensor(0.0)).item()
-            
-            # Store predictions and targets for R² calculation
-            if isinstance(batch_pk, (list, tuple)):
-                pk_target = batch_pk[1]
-            else:
-                pk_target = batch_pk['y']
-            
-            # Convert batch to proper format
-            if isinstance(batch_pk, (list, tuple)):
-                batch_dict = {'x': batch_pk[0], 'y': batch_pk[1]}
-            else:
-                batch_dict = batch_pk
-            
-            if self.config.use_mc_dropout:
-                pk_results = self.model.predict_with_uncertainty({'pk': batch_dict})
-            else:
-                pk_results = self.model({'pk': batch_dict})
-            pk_pred = pk_results['pk']['pred']
-            pk_predictions.append(pk_pred.detach().cpu())
-            pk_targets.append(pk_target.detach().cpu())
-            
             num_batches += 1
-            
-        # Calculate actual metrics
-        pk_mse = pk_loss / num_batches
-        pk_rmse = np.sqrt(pk_mse.item() if hasattr(pk_mse, 'item') else pk_mse)
-        pk_mae = pk_mse  # Approximation
-        
-        # Calculate R² using _reg_metrics from heads.py
-        if pk_predictions and pk_targets:
-            pk_pred_flat = torch.cat(pk_predictions).squeeze()
-            pk_target_flat = torch.cat(pk_targets).squeeze()
-            pk_metrics = _reg_metrics(pk_pred_flat, pk_target_flat)
-            pk_r2 = pk_metrics['r2']
-        else:
-            pk_r2 = 0.0
         
         return {
             'pk_loss': pk_loss / num_batches,
-            'pk_mse': pk_mse, 'pk_rmse': pk_rmse, 'pk_mae': pk_mae, 'pk_r2': float(pk_r2),
+            'pk_mse': 0.0, 'pk_rmse': 0.0, 'pk_mae': 0.0, 'pk_r2': 0.0,
         }
     
     def _train_pd_epoch(self) -> Dict[str, float]:
@@ -640,61 +477,35 @@ class UnifiedPKPDTrainer:
         pd_loss = 0.0
         num_batches = 0
         
-        # For R² calculation (using evaluation.py method)
-        pd_predictions = []
-        pd_targets = []
+        # Metrics accumulation
+        metrics_sum = {
+            'pd_mse': 0.0, 'pd_rmse': 0.0, 'pd_mae': 0.0, 'pd_r2': 0.0
+        }
         
         # Mixed precision settings
+        scaler = torch.cuda.amp.GradScaler() if self.device.type == 'cuda' else None
         
         for batch_pd in self.data_loaders['train_pd']:
             self.optimizer.zero_grad()
             batch_pd = self._to_device(batch_pd)
-                
-            loss_dict = self.loss_computation.compute_loss(None, batch_pd, self.mode, is_training=True)
-            loss_dict['total'].backward()
-            self.optimizer.step()
+            
+            if scaler is not None:
+                with torch.cuda.amp.autocast():
+                    loss_dict = self.loss_computation.compute_loss(None, batch_pd, self.mode)
+                scaler.scale(loss_dict['total']).backward()
+                scaler.step(self.optimizer)
+                scaler.update()
+            else:
+                loss_dict = self.loss_computation.compute_loss(None, batch_pd, self.mode)
+                loss_dict['total'].backward()
+                self.optimizer.step()
             
             pd_loss += loss_dict.get('pd', torch.tensor(0.0)).item()
-            
-            # Store predictions and targets for R² calculation
-            if isinstance(batch_pd, (list, tuple)):
-                pd_target = batch_pd[1]
-            else:
-                pd_target = batch_pd['y']
-                
-            # Convert batch to proper format
-            if isinstance(batch_pd, (list, tuple)):
-                batch_dict = {'x': batch_pd[0], 'y': batch_pd[1]}
-            else:
-                batch_dict = batch_pd
-                
-            if self.config.use_mc_dropout:
-                pd_results = self.model.predict_with_uncertainty({'pd': batch_dict})
-            else:
-                pd_results = self.model({'pd': batch_dict})
-            pd_pred = pd_results['pd']['pred']
-            pd_predictions.append(pd_pred.detach().cpu())
-            pd_targets.append(pd_target.detach().cpu())
-                
             num_batches += 1
-                
-        # Calculate actual metrics
-        pd_mse = pd_loss / num_batches
-        pd_rmse = np.sqrt(pd_mse.item() if hasattr(pd_mse, 'item') else pd_mse)
-        pd_mae = pd_mse  # Approximation
-        
-        # Calculate R² using _reg_metrics from heads.py
-        if pd_predictions and pd_targets:
-            pd_pred_flat = torch.cat(pd_predictions).squeeze()
-            pd_target_flat = torch.cat(pd_targets).squeeze()
-            pd_metrics = _reg_metrics(pd_pred_flat, pd_target_flat)
-            pd_r2 = pd_metrics['r2']
-        else:
-            pd_r2 = 0.0
         
         return {
             'pd_loss': pd_loss / num_batches,
-            'pd_mse': pd_mse, 'pd_rmse': pd_rmse, 'pd_mae': pd_mae, 'pd_r2': float(pd_r2),
+            'pd_mse': 0.0, 'pd_rmse': 0.0, 'pd_mae': 0.0, 'pd_r2': 0.0,
         }
     
     def _validate_epoch(self) -> Dict[str, float]:
@@ -713,101 +524,25 @@ class UnifiedPKPDTrainer:
         num_batches = 0
         
         val_loaders = self._get_val_loaders()
-        pk_loader, pd_loader = val_loaders
-        
-        # Process PK and PD batches independently (consistent with training)
-        pk_batches = list(pk_loader)
-        pd_batches = list(pd_loader)
-        
-        pk_predictions = []
-        pk_targets = []
-        pd_predictions = []
-        pd_targets = []
         
         with torch.no_grad():
-            # Process PK batches
-            for batch_pk in pk_batches:
+            for batch_pk, batch_pd in zip(*val_loaders):
                 batch_pk = self._to_device(batch_pk)
+                batch_pd = self._to_device(batch_pd)
                 
-                loss_dict = self.loss_computation.compute_loss(batch_pk, None, self.mode, is_training=True)
+                loss_dict = self.loss_computation.compute_loss(batch_pk, batch_pd, self.mode)
                 
                 total_loss += loss_dict['total'].item()
                 pk_loss += loss_dict.get('pk', 0.0)
-                
-                # Store predictions and targets for R² calculation
-                if isinstance(batch_pk, (list, tuple)):
-                    pk_target = batch_pk[1]
-                    batch_dict = {'x': batch_pk[0], 'y': batch_pk[1]}
-                else:
-                    pk_target = batch_pk['y']
-                    batch_dict = batch_pk
-                
-                if self.config.use_mc_dropout:
-                    pk_results = self.model.predict_with_uncertainty({'pk': batch_dict})
-                else:
-                    pk_results = self.model({'pk': batch_dict})
-                pk_pred = pk_results['pk']['pred']
-                pk_predictions.append(pk_pred.detach().cpu())
-                pk_targets.append(pk_target.detach().cpu())
-                
-                num_batches += 1
-            
-            # Process PD batches
-            for batch_pd in pd_batches:
-                batch_pd = self._to_device(batch_pd)
-                
-                loss_dict = self.loss_computation.compute_loss(None, batch_pd, self.mode, is_training=True)
-                
-                total_loss += loss_dict['total'].item()
                 pd_loss += loss_dict.get('pd', 0.0)
-                
-                # Store predictions and targets for R² calculation
-            if isinstance(batch_pd, (list, tuple)):
-                    pd_target = batch_pd[1]
-                    batch_dict = {'x': batch_pd[0], 'y': batch_pd[1]}
-            else:
-                    pd_target = batch_pd['y']
-                    batch_dict = batch_pd
-            
-            if self.config.use_mc_dropout:
-                pd_results = self.model.predict_with_uncertainty({'pd': batch_dict})
-            else:
-                pd_results = self.model({'pd': batch_dict})
-            pd_pred = pd_results['pd']['pred']
-            pd_predictions.append(pd_pred.detach().cpu())
-            pd_targets.append(pd_target.detach().cpu())
-            
-            num_batches += 1
+                num_batches += 1
         
-        # Calculate actual metrics
-        pk_mse = pk_loss / num_batches
-        pd_mse = pd_loss / num_batches
-        
-        # Calculate R² using _reg_metrics from heads.py
-        if pk_predictions and pk_targets:
-            pk_pred_flat = torch.cat(pk_predictions).squeeze()
-            pk_target_flat = torch.cat(pk_targets).squeeze()
-            pk_metrics = _reg_metrics(pk_pred_flat, pk_target_flat)
-            pk_r2 = pk_metrics['r2']
-        else:
-            pk_r2 = 0.0
-            
-        if pd_predictions and pd_targets:
-            pd_pred_flat = torch.cat(pd_predictions).squeeze()
-            pd_target_flat = torch.cat(pd_targets).squeeze()
-            pd_metrics = _reg_metrics(pd_pred_flat, pd_target_flat)
-            pd_r2 = pd_metrics['r2']
-        else:
-            pd_r2 = 0.0
-                
         return {
             'total_loss': total_loss / num_batches,
             'pk_loss': pk_loss / num_batches,
-            'pd_loss': pd_loss / num_batches,
-            'pk_mse': pk_mse, 'pk_rmse': np.sqrt(pk_mse.item() if hasattr(pk_mse, 'item') else pk_mse), 'pk_mae': pk_mse, 'pk_r2': float(pk_r2),
-            'pd_mse': pd_mse, 'pd_rmse': np.sqrt(pd_mse.item() if hasattr(pd_mse, 'item') else pd_mse), 'pd_mae': pd_mse, 'pd_r2': float(pd_r2),
+            'pd_loss': pd_loss / num_batches
         }
-        
+    
     def _validate_epoch_separate(self) -> Dict[str, float]:
         """Validate one epoch for separate mode - PK and PD separately"""
         self.model.eval()
@@ -820,7 +555,7 @@ class UnifiedPKPDTrainer:
             # Validate PK model
             for batch_pk in self.data_loaders['val_pk']:
                 batch_pk = self._to_device(batch_pk)
-                loss_dict = self.loss_computation.compute_loss(batch_pk, None, self.mode, is_training=False)
+                loss_dict = self.loss_computation.compute_loss(batch_pk, None, self.mode)
                 
                 total_loss += loss_dict['total'].item()
                 pk_loss += loss_dict.get('pk', torch.tensor(0.0)).item()
@@ -829,22 +564,16 @@ class UnifiedPKPDTrainer:
             # Validate PD model
             for batch_pd in self.data_loaders['val_pd']:
                 batch_pd = self._to_device(batch_pd)
-                loss_dict = self.loss_computation.compute_loss(None, batch_pd, self.mode, is_training=False)
+                loss_dict = self.loss_computation.compute_loss(None, batch_pd, self.mode)
                 
                 total_loss += loss_dict['total'].item()
                 pd_loss += loss_dict.get('pd', torch.tensor(0.0)).item()
-            num_batches += 1
-        
-        # Calculate basic metrics
-        pk_mse = pk_loss / num_batches
-        pd_mse = pd_loss / num_batches
+                num_batches += 1
         
         return {
             'total_loss': total_loss / num_batches,
             'pk_loss': pk_loss / num_batches,
             'pd_loss': pd_loss / num_batches,
-            'pk_mse': pk_mse, 'pk_rmse': np.sqrt(pk_mse), 'pk_mae': pk_mse, 'pk_r2': 0.0,
-            'pd_mse': pd_mse, 'pd_rmse': np.sqrt(pd_mse), 'pd_mae': pd_mse, 'pd_r2': 0.0,
         }
     
     def _validate_pk_epoch(self) -> Dict[str, float]:
@@ -852,52 +581,18 @@ class UnifiedPKPDTrainer:
         self.model.eval()
         pk_loss = 0.0
         num_batches = 0
-        # For R² calculation (using evaluation.py method)
-        pk_predictions = []
-        pk_targets = []
+        
         with torch.no_grad():
             for batch_pk in self.data_loaders['val_pk']:
                 batch_pk = self._to_device(batch_pk)
-                loss_dict = self.loss_computation.compute_loss(batch_pk, None, self.mode, is_training=False)
+                loss_dict = self.loss_computation.compute_loss(batch_pk, None, self.mode)
                 
                 pk_loss += loss_dict.get('pk', torch.tensor(0.0)).item()
-                # Store predictions and targets for R² calculation
-            if isinstance(batch_pk, (list, tuple)):
-                    pk_target = batch_pk[1]
-            else:
-                    pk_target = batch_pk['y']
-                
-                # Convert batch to proper format
-            if isinstance(batch_pk, (list, tuple)):
-                batch_dict = {'x': batch_pk[0], 'y': batch_pk[1]}
-            else:
-                batch_dict = batch_pk
-            
-            if self.config.use_mc_dropout:
-                pk_results = self.model.predict_with_uncertainty({'pk': batch_dict})
-            else:
-                pk_results = self.model({'pk': batch_dict})
-            pk_pred = pk_results['pk']['pred']
-            pk_predictions.append(pk_pred.detach().cpu())
-            pk_targets.append(pk_target.detach().cpu())
-            
-            num_batches += 1
+                num_batches += 1
         
-        # Calculate actual metrics
-        pk_mse = pk_loss / num_batches
-        pk_rmse = np.sqrt(pk_mse.item() if hasattr(pk_mse, 'item') else pk_mse)
-        pk_mae = pk_mse  # Approximation
-        # Calculate R² using _reg_metrics from heads.py
-        if pk_predictions and pk_targets:
-            pk_pred_flat = torch.cat(pk_predictions).squeeze()
-            pk_target_flat = torch.cat(pk_targets).squeeze()
-            pk_metrics = _reg_metrics(pk_pred_flat, pk_target_flat)
-            pk_r2 = pk_metrics['r2']
-        else:
-            pk_r2 = 0.0      
         return {
             'pk_loss': pk_loss / num_batches,
-            'pk_mse': pk_mse, 'pk_rmse': pk_rmse, 'pk_mae': pk_mae, 'pk_r2': pk_r2,
+            'pk_mse': 0.0, 'pk_rmse': 0.0, 'pk_mae': 0.0, 'pk_r2': 0.0,
         }
     
     def _validate_pd_epoch(self) -> Dict[str, float]:
@@ -905,61 +600,27 @@ class UnifiedPKPDTrainer:
         self.model.eval()
         pd_loss = 0.0
         num_batches = 0
-        # For R² calculation (using evaluation.py method)
-        pd_predictions = []
-        pd_targets = []
         
         with torch.no_grad():
             for batch_pd in self.data_loaders['val_pd']:
                 batch_pd = self._to_device(batch_pd)
-                loss_dict = self.loss_computation.compute_loss(None, batch_pd, self.mode, is_training=False)
+                loss_dict = self.loss_computation.compute_loss(None, batch_pd, self.mode)
                 
                 pd_loss += loss_dict.get('pd', torch.tensor(0.0)).item()
-                # Store predictions and targets for R² calculation
-            if isinstance(batch_pd, (list, tuple)):
-                pd_target = batch_pd[1]
-            else:
-                pd_target = batch_pd['y']
-                    
-                # Convert batch to proper format
-            if isinstance(batch_pd, (list, tuple)):
-                    batch_dict = {'x': batch_pd[0], 'y': batch_pd[1]}
-            else:
-                    batch_dict = batch_pd
-            
-            if self.config.use_mc_dropout:
-                pd_results = self.model.predict_with_uncertainty({'pd': batch_dict})
-            else:
-                pd_results = self.model({'pd': batch_dict})
-            pd_pred = pd_results['pd']['pred']
-            pd_predictions.append(pd_pred.detach().cpu())
-            pd_targets.append(pd_target.detach().cpu())
-                
-            num_batches += 1
+                num_batches += 1
         
-        # Calculate actual metrics
-        pd_mse = pd_loss / num_batches
-        pd_rmse = np.sqrt(pd_mse.item() if hasattr(pd_mse, 'item') else pd_mse)
-        pd_mae = pd_mse  # Approximation
-        
-        # Calculate R² using _reg_metrics from heads.py
-        if pd_predictions and pd_targets:
-            pd_pred_flat = torch.cat(pd_predictions).squeeze()
-            pd_target_flat = torch.cat(pd_targets).squeeze()
-            pd_metrics = _reg_metrics(pd_pred_flat, pd_target_flat)
-            pd_r2 = pd_metrics['r2']
-        else:
-            pd_r2 = 0.0        
         return {
             'pd_loss': pd_loss / num_batches,
-            'pd_mse': pd_mse, 'pd_rmse': pd_rmse, 'pd_mae': pd_mae, 'pd_r2': pd_r2,
+            'pd_mse': 0.0, 'pd_rmse': 0.0, 'pd_mae': 0.0, 'pd_r2': 0.0,
         }
     
     def _get_train_loaders(self) -> List[Any]:
-            return [self.data_loaders['train_pk'], self.data_loaders['train_pd']]
+        """Return training data loaders"""
+        return [self.data_loaders['train_pk'], self.data_loaders['train_pd']]
     
     def _get_val_loaders(self) -> List[Any]:
-            return [self.data_loaders['val_pk'], self.data_loaders['val_pd']]
+        """Return validation data loaders"""
+        return [self.data_loaders['val_pk'], self.data_loaders['val_pd']]
     
     def _to_device(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         """Move batch to device"""
@@ -1037,9 +698,6 @@ class UnifiedPKPDTrainer:
     
     def _save_best_model(self):
         """Save best model"""
-        # Ensure directory exists
-        self.model_save_directory.mkdir(parents=True, exist_ok=True)
-        
         model_path = self.model_save_directory / "best_model.pth"
         torch.save({
             'model_state_dict': self.model.state_dict(),
@@ -1048,37 +706,6 @@ class UnifiedPKPDTrainer:
             'val_loss': self.best_val_loss,
             'config': self.config
         }, model_path)
-    
-    def save_model(self, filename: str):
-        """Save model"""
-        # Ensure directory exists
-        self.model_save_directory.mkdir(parents=True, exist_ok=True)
-        
-        model_path = self.model_save_directory / filename
-        
-        # Create a copy of the model without batch_input functions for saving
-        import copy
-        model_for_saving = copy.deepcopy(self.model)
-        
-        # Remove batch_input functions that can't be pickled
-        def remove_batch_input_functions(module):
-            for name, child in module.named_children():
-                if hasattr(child, 'batched_qnode'):
-                    child.batched_qnode = None
-                remove_batch_input_functions(child)
-        
-        remove_batch_input_functions(model_for_saving)
-        
-        torch.save({
-            'model_state_dict': self.model.state_dict(),
-            'model': model_for_saving,  # Clean model object for saving
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'epoch': self.epoch,
-            'val_loss': self.best_val_loss,
-            'config': self.config,
-            'training_history': self.training_history
-        }, model_path)
-        self.logger.info(f"Model saved: {model_path}")
     
     def _get_final_results(self) -> Dict[str, Any]:
         """Return final results including test metrics"""

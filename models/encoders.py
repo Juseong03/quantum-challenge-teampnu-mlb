@@ -4,10 +4,13 @@ All encoders in one place for better organization
 """
 
 import math
+import numpy as np
 from typing import Any, Dict, List, Tuple, Union, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import pennylane as qml
+
 
 # =========================
 # Pooling Layer
@@ -56,7 +59,6 @@ class Pooling(nn.Module):
 # =========================
 # Base Encoder
 # =========================
-
 class BaseEncoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
@@ -64,7 +66,6 @@ class BaseEncoder(nn.Module):
 # =========================
 # MLP Encoder
 # =========================
-
 class MLPEncoder(BaseEncoder):
     def __init__(
         self,
@@ -103,7 +104,6 @@ class MLPEncoder(BaseEncoder):
 # =========================
 # ResNet Block
 # =========================
-
 class ResBlock(nn.Module):
     def __init__(
             self, d: int, 
@@ -124,7 +124,6 @@ class ResBlock(nn.Module):
 # =========================
 # ResMLP Encoder (Basic)
 # =========================
-
 class ResMLPEncoder(BaseEncoder):
     def __init__(
         self,
@@ -168,7 +167,6 @@ class ResMLPEncoder(BaseEncoder):
 # =========================
 # MoE (Mixture of Experts) - Basic
 # =========================
-
 class MoEBlock(nn.Module):
     """Basic Mixture of Experts block with residual connection."""
     
@@ -233,7 +231,6 @@ class MoEBlock(nn.Module):
 
 class MoEEncoder(BaseEncoder):
     """Basic Mixture of Experts encoder with residual connections."""
-    
     def __init__(self, in_dim: int, hidden_dims: List[int], num_experts: int = 4, 
                  top_k: int = 2, dropout: float = 0.1, activation: str = "relu"):
         super().__init__()
@@ -262,7 +259,6 @@ class MoEEncoder(BaseEncoder):
 
 class ResidualMLPBlock(nn.Module):
     """Advanced Residual MLP Block with LayerNorm and Dropout"""
-    
     def __init__(
         self,
         hidden_dim: int,
@@ -607,126 +603,6 @@ class ResMLPMoEEncoder(BaseEncoder):
         
         return x, total_aux_loss
 
-
-class AdaptiveResMLPMoEEncoder(ResMLPMoEEncoder):
-    """
-    Adaptive ResMLP + MoE Encoder with dynamic expert selection
-    """
-    
-    def __init__(
-        self,
-        in_dim: int,
-        hidden_dim: int = 256,
-        num_layers: int = 6,
-        num_experts: int = 8,
-        top_k: int = 2,
-        mlp_ratio: float = 4.0,
-        dropout: float = 0.1,
-        activation: str = "gelu",
-        time_pool: Optional[str] = None,
-        adaptive_experts: bool = True,
-        expert_growth_rate: float = 1.2
-    ):
-        super().__init__(
-            in_dim=in_dim,
-            hidden_dim=hidden_dim,
-            num_layers=num_layers,
-            num_experts=num_experts,
-            top_k=top_k,
-            mlp_ratio=mlp_ratio,
-            dropout=dropout,
-            activation=activation,
-            time_pool=time_pool
-        )
-        
-        self.adaptive_experts = adaptive_experts
-        self.expert_growth_rate = expert_growth_rate
-        
-        if adaptive_experts:
-            # Expert importance tracking
-            self.expert_importance = nn.Parameter(torch.ones(num_experts))
-            self.importance_decay = 0.99
-    
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # Update expert importance
-        if self.adaptive_experts and self.training:
-            with torch.no_grad():
-                self.expert_importance.data *= self.importance_decay
-        
-        # Standard forward pass
-        output, total_aux_loss = super().forward(x)
-        
-        # Adaptive expert selection (future enhancement)
-        if self.adaptive_experts and self.training:
-            # Could implement dynamic expert selection based on importance
-            pass
-        
-        return output, total_aux_loss
-
-# =========================
-# Dual Stage Encoder
-# =========================
-
-class SimpleMLPEncoder(BaseEncoder):
-    """Simple MLP encoder for dual-stage model."""
-    
-    def __init__(self, in_dim: int, hidden_dims: List[int], dropout: float = 0.1):
-        super().__init__()
-        self.in_dim = in_dim
-        self.hidden_dims = hidden_dims
-        self.out_dim = hidden_dims[-1]
-        
-        layers = []
-        prev_dim = in_dim
-        for hidden_dim in hidden_dims:
-            layers.extend([
-                nn.Linear(prev_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout)
-            ])
-            prev_dim = hidden_dim
-        
-        self.net = nn.Sequential(*layers)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-class DualStageEncoder(BaseEncoder):
-    """Dual-stage encoder: front encoder -> z -> back encoder -> z2."""
-    
-    def __init__(self, in_dim: int, front_dims: List[int], back_dims: List[int], 
-                 dropout: float = 0.1, activation: str = "relu"):
-        super().__init__()
-        self.in_dim = in_dim
-        self.front_dims = front_dims
-        self.back_dims = back_dims
-        self.out_dim = back_dims[-1]
-        
-        # Front encoder (for PK)
-        self.front_encoder = SimpleMLPEncoder(in_dim, front_dims, dropout)
-        
-        # Back encoder (for PD)
-        self.back_encoder = SimpleMLPEncoder(front_dims[-1], back_dims, dropout)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Front encoder
-        z = self.front_encoder(x)  # [B, front_dims[-1]]
-        
-        # Back encoder
-        z2 = self.back_encoder(z)  # [B, back_dims[-1]]
-        
-        return z2
-    
-    def forward_front(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward through front encoder only (for PK)."""
-        return self.front_encoder(x)
-    
-    def forward_back(self, z: torch.Tensor) -> torch.Tensor:
-        """Forward through back encoder only (for PD)."""
-        return self.back_encoder(z)
-
-
 class CNNEncoder(BaseEncoder):
     """CNN-based encoder for sequence data"""
     
@@ -796,43 +672,285 @@ class CNNEncoder(BaseEncoder):
         
         return x
 
-# =========================
-# Factory Functions
-# =========================
 
-def create_resmlp_moe_encoder(
-    in_dim: int,
-    hidden_dim: int = 256,
-    num_layers: int = 6,
-    num_experts: int = 8,
-    top_k: int = 2,
-    variant: str = "standard"
-) -> ResMLPMoEEncoder:
-    """
-    Factory function to create ResMLP + MoE encoders
+def _quantum_circuit(inputs, weights):
+    """Quantum circuit function that can be pickled"""
+    # Get dimensions from weights shape
+    n_layers, n_qubits = weights.shape[:2]
     
-    Args:
-        in_dim: Input dimension
-        hidden_dim: Hidden dimension
-        num_layers: Number of ResMLP+MoE blocks
-        num_experts: Number of experts in MoE
-        top_k: Number of experts to use per token
-        variant: "standard" or "adaptive"
-    """
-    if variant == "adaptive":
-        return AdaptiveResMLPMoEEncoder(
-            in_dim=in_dim,
-            hidden_dim=hidden_dim,
-            num_layers=num_layers,
-            num_experts=num_experts,
-            top_k=top_k
-        )
-    else:
-        return ResMLPMoEEncoder(
-            in_dim=in_dim,
-            hidden_dim=hidden_dim,
-            num_layers=num_layers,
-            num_experts=num_experts,
-            top_k=top_k
-        )
+    # Encode classical data
+    for i in range(n_qubits):
+        if i < len(inputs):
+            qml.RY(inputs[i], wires=i)
+    # Variational layers
+    for l in range(n_layers):
+        for q in range(n_qubits):
+            qml.Rot(*weights[l, q], wires=q)
+        for q in range(n_qubits - 1):
+            qml.CNOT(wires=[q, q + 1])
+    return [qml.expval(qml.PauliZ(i)) for i in range(n_qubits)]
 
+
+class QuantumLinear(nn.Module):
+    """
+    Hybrid Quantum Linear layer:
+    입력을 qubit 수에 맞춰 encode → quantum circuit → classical readout
+    """
+    def __init__(self, in_features: int, out_features: int, n_qubits: int = 4, n_layers: int = 1):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.n_qubits = n_qubits
+        self.n_layers = n_layers
+
+        self.dev = qml.device("default.qubit", wires=n_qubits)
+        self.params = nn.Parameter(torch.randn(n_layers, n_qubits, 3))
+        
+        # Create circuit as a separate method to avoid pickle issues
+        self.circuit = qml.QNode(
+            _quantum_circuit,
+            self.dev, 
+            interface="torch"
+        )
+        self.readout = nn.Linear(n_qubits, out_features)
+
+    def forward(self, x: torch.Tensor):
+        outputs = []
+        for sample in x:
+            q_out = self.circuit(sample, self.params)
+            # Preserve device information
+            if isinstance(q_out, list):
+                q_out = torch.stack([torch.tensor(val, dtype=torch.float32, device=x.device) for val in q_out])
+            else:
+                q_out = torch.tensor(q_out, dtype=torch.float32, device=x.device)
+            outputs.append(q_out)
+        q_out = torch.stack(outputs)
+        return self.readout(q_out)
+
+
+
+class QMLPEncoder(BaseEncoder):
+    """
+    Hybrid Quantum MLP Encoder
+    [nn.Linear → QuantumLinear → nn.Linear...]
+    """
+    def __init__(
+        self,
+        in_dim: int,
+        hidden: int = 256,
+        depth: int = 3,
+        dropout: float = 0.1,
+        time_pool: str = None,
+        use_input_ln: bool = False,
+        n_qubits: int = 4,
+        n_layers: int = 1
+    ):
+        super().__init__()
+        self.in_dim = in_dim
+        self.time_pool = time_pool
+
+        if time_pool in ["mean", "max", "min", "attn"]:
+            self.pooling = Pooling(in_dim, hidden, mode=time_pool)
+            d = hidden
+        else:
+            self.pooling = None
+            d = in_dim
+
+        layers = []
+        if use_input_ln:
+            layers.append(nn.LayerNorm(d))
+
+        # 첫 classical projection
+        layers += [nn.Linear(d, hidden), nn.ReLU(), nn.Dropout(dropout)]
+
+        # 중간 quantum block
+        layers += [QuantumLinear(hidden, hidden, n_qubits=n_qubits, n_layers=n_layers), nn.ReLU()]
+
+        # 나머지 classical MLP
+        for _ in range(depth - 2):
+            layers += [nn.Linear(hidden, hidden), nn.ReLU(), nn.Dropout(dropout)]
+
+        # 마지막 classical output projection
+        layers += [nn.Linear(hidden, hidden)]
+        self.net = nn.Sequential(*layers)
+        self.out_dim = hidden
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 3 and self.pooling is not None:
+            x = self.pooling(x)
+        return self.net(x)
+
+
+class QResMLPEncoder(BaseEncoder):
+    """
+    Hybrid Quantum ResMLP Encoder
+    [nn.Linear stem → QuantumLinear block 삽입 → Residual Blocks]
+    """
+    def __init__(
+        self,
+        in_dim: int,
+        hidden: int = 256,
+        num_layers: int = 4,
+        dropout: float = 0.1,
+        time_pool: str = None,
+        n_qubits: int = 4,
+        n_layers: int = 1
+    ):
+        super().__init__()
+        self.hidden = hidden
+        self.pooling = Pooling(in_dim, hidden, mode=time_pool) if time_pool in ["mean", "max", "min", "attn"] else None
+        stem_in = hidden if self.pooling else in_dim
+
+        # Stem: classical
+        self.stem = nn.Sequential(nn.Linear(stem_in, hidden), nn.ReLU(), nn.Dropout(dropout))
+
+        # Quantum block 삽입
+        self.qblock = QuantumLinear(hidden, hidden, n_qubits=n_qubits, n_layers=n_layers)
+
+        # Residual MLP blocks
+        self.blocks = nn.Sequential(*[ResBlock(hidden, dropout=dropout) for _ in range(num_layers)])
+        self.final_ln = nn.LayerNorm(hidden)
+        self.out_dim = hidden
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 3 and self.pooling is not None:
+            x = self.pooling(x)
+        x = self.stem(x)
+        x = self.qblock(x)
+        x = self.blocks(x)
+        return self.final_ln(x)
+
+class QMoEEncoder(BaseEncoder):
+    """
+    Hybrid Quantum MoE Encoder
+    Experts의 첫 projection만 QuantumLinear로 교체
+    """
+    def __init__(
+        self,
+        in_dim: int,
+        hidden: List[int],
+        num_experts: int = 4,
+        top_k: int = 2,
+        dropout: float = 0.1,
+        activation: str = "relu",
+        n_qubits: int = 4,
+        n_layers: int = 1
+    ):
+        super().__init__()
+        self.out_dim = hidden[-1]
+
+        class QuantumMoEBlock(MoEBlock):
+            def __init__(self, in_dim, hidden, num_experts, top_k, dropout, activation):
+                super().__init__(in_dim, hidden, num_experts, top_k, dropout, activation)
+                self.experts = nn.ModuleList([
+                    nn.Sequential(
+                        QuantumLinear(in_dim, hidden, n_qubits=n_qubits, n_layers=n_layers),
+                        nn.ReLU() if activation == "relu" else nn.GELU(),
+                        nn.Dropout(dropout),
+                        nn.Linear(hidden, in_dim)  # readout은 classical
+                    ) for _ in range(num_experts)
+                ])
+
+        layers = []
+        prev_dim = in_dim
+        for hidden in hidden:
+            layers.append(QuantumMoEBlock(prev_dim, hidden, num_experts, top_k, dropout, activation))
+            if hidden != prev_dim:
+                layers.append(nn.Linear(prev_dim, hidden))
+                prev_dim = hidden
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+class QResMLPMoEEncoder(BaseEncoder):
+    """
+    Hybrid Quantum ResMLP + MoE Encoder
+    - Input projection은 classical
+    - 중간 QuantumLinear block 추가
+    - MoE는 classical + quantum experts 혼합 가능
+    """
+    def __init__(
+        self,
+        in_dim: int,
+        hidden: int = 256,
+        num_layers: int = 6,
+        num_experts: int = 8,
+        top_k: int = 2,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.1,
+        activation: str = "gelu",
+        time_pool: Optional[str] = None,
+        use_input_projection: bool = True,
+        use_output_projection: bool = True,
+        n_qubits: int = 4,
+        n_layers: int = 1
+    ):
+        super().__init__()
+        self.out_dim = hidden
+
+        # 입력 projection (classical)
+        if use_input_projection:
+            self.input_proj = nn.Sequential(
+                nn.Linear(in_dim, hidden),
+                nn.LayerNorm(hidden),
+                nn.Dropout(dropout)
+            )
+        else:
+            self.input_proj = nn.Identity()
+
+        # 중간 quantum block
+        self.qblock = QuantumLinear(hidden, hidden, n_qubits=n_qubits, n_layers=n_layers)
+
+        # ResMLP + MoE blocks
+        self.blocks = nn.ModuleList([
+            ResMLPMoEBlock(hidden, num_experts, top_k, mlp_ratio, dropout, activation)
+            for _ in range(num_layers)
+        ])
+
+        # Time pooling
+        if time_pool in ["mean", "max", "min", "attn"]:
+            if time_pool == "attn":
+                self.pooling = nn.Sequential(
+                    nn.Linear(hidden, hidden),
+                    nn.Tanh(),
+                    nn.Linear(hidden, 1),
+                    nn.Softmax(dim=1)
+                )
+            else:
+                self.pooling = time_pool
+        else:
+            self.pooling = None
+
+        # Output projection (classical)
+        if use_output_projection:
+            self.output_proj = nn.Sequential(
+                nn.LayerNorm(hidden),
+                nn.Linear(hidden, hidden),
+                nn.Dropout(dropout)
+            )
+        else:
+            self.output_proj = nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        x = self.input_proj(x)
+        x = self.qblock(x)
+
+        total_aux_loss = 0.0
+        for block in self.blocks:
+            x, aux_loss = block(x)
+            total_aux_loss += aux_loss
+
+        if self.pooling is not None and x.dim() == 3:
+            if self.pooling == "mean":
+                x = x.mean(dim=1)
+            elif self.pooling == "max":
+                x = x.max(dim=1).values
+            elif self.pooling == "min":
+                x = x.min(dim=1).values
+            elif isinstance(self.pooling, nn.Module):
+                weights = self.pooling(x)
+                x = (x * weights).sum(dim=1)
+
+        x = self.output_proj(x)
+        return x, total_aux_loss

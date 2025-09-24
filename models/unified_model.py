@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple, Union, Any
+from utils.factory import build_encoder, build_head
 from .encoders import BaseEncoder
 from .heads import BaseHead
 
@@ -131,12 +132,10 @@ class UnifiedPKPDModel(nn.Module):
     
     def _create_encoder(self, encoder_type: str, input_dim: int) -> BaseEncoder:
         """Create encoder"""
-        from utils.helpers import build_encoder
         return build_encoder(encoder_type, input_dim, self.config)
     
     def _create_head(self, head_type: str, input_dim: int, branch: str) -> BaseHead:
         """Create head"""
-        from utils.helpers import build_head
         return build_head(head_type, input_dim, self.config)
     
     def _setup_joint_connections(self): 
@@ -566,7 +565,7 @@ class UnifiedPKPDModel(nn.Module):
                 # Collect multiple predictions
                 predictions = []
                 
-                for _ in range(n_samples):
+                for i in range(n_samples):
                     # Forward pass with dropout enabled
                     branch_results = self.forward({branch: batch[branch]})
                     pred = branch_results[branch]['pred']

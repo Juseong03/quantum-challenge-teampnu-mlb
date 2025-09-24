@@ -10,7 +10,15 @@ from datetime import datetime
 # Additional utility functions
 import os
 from pathlib import Path
+import torch
+import numpy as np
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.preprocessing import StandardScaler
 
+from itertools import cycle
+from models.heads import MSEHead
+from models.encoders import MLPEncoder, ResMLPEncoder, MoEEncoder, ResMLPMoEEncoder
+from models.encoders import QResMLPMoEEncoder, QMoEEncoder, QResMLPEncoder, QMLPEncoder, CNNEncoder
 
 def generate_run_name(config) -> str:
     """
@@ -74,82 +82,11 @@ def generate_run_name(config) -> str:
     return run_name
 
 
-def build_encoder(encoder_type, input_dim, config):
-    """Build encoder"""
-    if encoder_type == "mlp":
-        from models.encoders import MLPEncoder
-        return MLPEncoder(input_dim, config.hidden, config.depth, config.dropout)
-    
-    elif encoder_type == "resmlp":
-        from models.encoders import ResMLPEncoder
-        return ResMLPEncoder(input_dim, config.hidden, config.depth, config.dropout)
-    
-    elif encoder_type == "moe":
-        from models.encoders import MoEEncoder
-        return MoEEncoder(
-            in_dim=input_dim,
-            hidden_dims=[config.hidden] * config.depth,
-            num_experts=getattr(config, 'num_experts', 8),
-            top_k=getattr(config, 'top_k', 2),
-            dropout=config.dropout
-        )
-    
-    elif encoder_type == "resmlp_moe":
-        from models.encoders import create_resmlp_moe_encoder
-        encoder = create_resmlp_moe_encoder(
-            in_dim=input_dim,
-            hidden_dim=config.hidden,
-            num_layers=config.depth,
-            num_experts=getattr(config, 'num_experts', 8),
-            top_k=getattr(config, 'top_k', 2),
-            variant="standard"
-        )
-        return encoder
-    
-    elif encoder_type == "adaptive_resmlp_moe":
-        from models.encoders import create_resmlp_moe_encoder
-        return create_resmlp_moe_encoder(
-            in_dim=input_dim,
-            hidden_dim=config.hidden,
-            num_layers=config.depth,
-            num_experts=getattr(config, 'num_experts', 8),
-            top_k=getattr(config, 'top_k', 2),
-            variant="adaptive"
-        )
-    
-    elif encoder_type == "cnn":
-        from models.encoders import CNNEncoder
-        return CNNEncoder(
-            in_dim=input_dim,
-            hidden=config.hidden,
-            depth=config.depth,
-            dropout=config.dropout,
-            kernel_size=getattr(config, 'kernel_size', 3),
-            num_filters=getattr(config, 'num_filters', 64)
-        )
-    else:
-        # Fallback to MLP for unknown encoders
-        from models.encoders import MLPEncoder
-        return MLPEncoder(input_dim, config.hidden, config.depth, config.dropout)
-
-def build_head(head_type, hidden_dim, config=None):
-    """Build head"""
-    if head_type == "mse":
-        from models.heads import MSEHead
-        dropout_rate = config.mc_dropout_rate if config and config.use_mc_dropout else 0.0
-        return MSEHead(hidden_dim, dropout_rate)
-    else:
-        from models.heads import MSEHead
-        dropout_rate = config.mc_dropout_rate if config and config.use_mc_dropout else 0.0
-        return MSEHead(hidden_dim, dropout_rate)
 
 
-def scaling_and_prepare_loader(data, features, batch_size, lambda_ctr, target_col, num_workers, pin_memory, drop_last_train):
+def scaling_and_prepare_loader(data, features, batch_size, target_col):
     """Prepare data loader"""
-    import torch
-    import numpy as np
-    from torch.utils.data import DataLoader, TensorDataset
-    from sklearn.preprocessing import StandardScaler
+
     
     # Extract features and target
     if isinstance(data, dict):
@@ -167,12 +104,19 @@ def scaling_and_prepare_loader(data, features, batch_size, lambda_ctr, target_co
     X_train = train_data[features].values.astype(np.float32)
     y_train = train_data[target_col].values.astype(np.float32).reshape(-1, 1)
     
-    # Fit scaler on training data
+    # Fit scaler on training data (optional scaling)
     scaler_X = StandardScaler()
     scaler_y = StandardScaler()
     
-    X_train_scaled = scaler_X.fit_transform(X_train)
-    y_train_scaled = scaler_y.fit_transform(y_train)
+    # Option to disable scaling for testing
+    use_scaling = True  # Set to False to disable scaling
+    
+    if use_scaling:
+        X_train_scaled = scaler_X.fit_transform(X_train)
+        y_train_scaled = scaler_y.fit_transform(y_train)
+    else:
+        X_train_scaled = X_train
+        y_train_scaled = y_train
     
     # Create datasets
     train_dataset = TensorDataset(
@@ -183,8 +127,13 @@ def scaling_and_prepare_loader(data, features, batch_size, lambda_ctr, target_co
     # Prepare validation data
     X_val = val_data[features].values.astype(np.float32)
     y_val = val_data[target_col].values.astype(np.float32).reshape(-1, 1)
-    X_val_scaled = scaler_X.transform(X_val)
-    y_val_scaled = scaler_y.transform(y_val)
+    
+    if use_scaling:
+        X_val_scaled = scaler_X.transform(X_val)
+        y_val_scaled = scaler_y.transform(y_val)
+    else:
+        X_val_scaled = X_val
+        y_val_scaled = y_val
     
     val_dataset = TensorDataset(
         torch.tensor(X_val_scaled),
@@ -194,8 +143,13 @@ def scaling_and_prepare_loader(data, features, batch_size, lambda_ctr, target_co
     # Prepare test data
     X_test = test_data[features].values.astype(np.float32)
     y_test = test_data[target_col].values.astype(np.float32).reshape(-1, 1)
-    X_test_scaled = scaler_X.transform(X_test)
-    y_test_scaled = scaler_y.transform(y_test)
+    
+    if use_scaling:
+        X_test_scaled = scaler_X.transform(X_test)
+        y_test_scaled = scaler_y.transform(y_test)
+    else:
+        X_test_scaled = X_test
+        y_test_scaled = y_test
     
     test_dataset = TensorDataset(
         torch.tensor(X_test_scaled),
@@ -207,28 +161,21 @@ def scaling_and_prepare_loader(data, features, batch_size, lambda_ctr, target_co
         train_dataset, 
         batch_size=batch_size, 
         shuffle=True, 
-        num_workers=num_workers, 
-        pin_memory=pin_memory, 
-        drop_last=drop_last_train
     )
     
     val_loader = DataLoader(
         val_dataset, 
         batch_size=batch_size, 
         shuffle=False, 
-        num_workers=num_workers, 
-        pin_memory=pin_memory
     )
     
     test_loader = DataLoader(
         test_dataset, 
         batch_size=batch_size, 
         shuffle=False, 
-        num_workers=num_workers, 
-        pin_memory=pin_memory
     )
     
-    return scaler_X, train_loader, val_loader, test_loader
+    return scaler_X, scaler_y, train_loader, val_loader, test_loader
 
 class ReIter:
     """Re-iterable wrapper for data loaders"""
@@ -241,7 +188,6 @@ class ReIter:
 
 def roundrobin_loaders(*loaders):
     """Round-robin through multiple loaders"""
-    from itertools import cycle
     # Create iterators for each loader
     iterators = [iter(loader) for loader in loaders]
     # Cycle through the iterators
@@ -267,7 +213,6 @@ def ensure_dir(path: str) -> Path:
 
 def get_device(device_id=0):
     """Return available device with specified device ID"""
-    import torch
     if torch.cuda.is_available():
         if device_id >= torch.cuda.device_count():
             print(f"Warning: Device {device_id} not available. Using device 0 instead.")

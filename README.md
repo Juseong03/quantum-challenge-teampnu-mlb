@@ -1,193 +1,244 @@
 # PK/PD Modeling System
 
-A comprehensive machine learning system for Pharmacokinetic/Pharmacodynamic (PK/PD) modeling with advanced neural network architectures and training strategies.
+A comprehensive machine learning system for Pharmacokinetic (PK) and Pharmacodynamic (PD) modeling with multiple training modes and advanced features.
 
-## 🚀 **Features**
+## 🚀 **Quick Start**
 
-### **Multiple Training Modes**
-- **Separate**: Independent PK and PD model training
-- **Joint**: Simultaneous PK/PD training with shared loss
-- **Shared**: Shared encoder with separate heads
-- **Dual Stage**: Two-stage training approach
-- **Integrated**: Fully integrated PK/PD modeling
-- **Two Stage Shared**: Two-stage with shared components
+### **Training a Model**
+```bash
+# Basic training (now with deterministic splitting by default)
+python main.py --mode separate --encoder mlp --epochs 100
 
-### **Advanced Encoders**
-- **MLP**: Multi-layer perceptron
-- **ResMLP**: Residual MLP with skip connections
-- **MoE**: Mixture of Experts
-- **ResMLP+MoE**: Combined residual and mixture of experts
-- **Adaptive ResMLP+MoE**: Adaptive mixture of experts
-- **CNN**: Convolutional neural network for sequence data
+# Training with feature engineering
+python main.py --mode separate --encoder mlp --epochs 100 --use_fe
+```
 
-### **Advanced Techniques**
-- **Mixup Augmentation**: Data augmentation for improved generalization
-- **Contrastive Learning**: Self-supervised learning approach
-- **Feature Engineering**: Advanced data preprocessing and feature creation
+### **Making Predictions**
+```bash
+# Basic prediction (now with improved consistency by default)
+python predict.py \
+    --model_path results/runs/your_run/separate/mlp/s42 \
+    --data_path data/new_data.csv \
+    --output_path predictions.csv
+
+# Prediction with uncertainty quantification
+python predict.py \
+    --model_path results/runs/your_run/separate/mlp/s42 \
+    --data_path data/new_data.csv \
+    --output_path predictions_with_uncertainty.csv \
+    --uncertainty
+```
 
 ## 📁 **Project Structure**
 
 ```
-TeamPNU_exp/
-├── main.py                    # Main training script
+TeamPNU2/
+├── main.py                    # Main training script (with deterministic splitting)
+├── predict.py                 # Prediction script (with scaler consistency)
 ├── config.py                  # Configuration management
-├── requirements.txt           # Dependencies
-├── README.md                  # This file
-├── DIRECTORY_STRUCTURE.md     # Directory structure documentation
-├── data/                      # Data processing modules
+├── requirements.txt           # Python dependencies
+│
+├── data/                      # Data handling
 │   ├── loaders.py            # Data loading utilities
-│   └── splits.py             # Data splitting strategies
+│   ├── splits.py             # Data splitting strategies
+│   └── EstData.csv           # Sample dataset
+│
 ├── models/                    # Model architectures
+│   ├── unified_model.py      # Unified PK/PD model
 │   ├── encoders.py           # Encoder implementations
-│   ├── heads.py              # Output head implementations
-│   └── unified_model.py      # Unified model architecture
-├── training/                  # Training modules
-│   └── unified_trainer.py    # Unified training system
+│   └── heads.py              # Prediction heads
+│
+├── training/                  # Training utilities
+│   └── unified_trainer.py    # Unified trainer for all modes
+│
 ├── utils/                     # Utility functions
 │   ├── helpers.py            # Helper functions
-│   ├── logging.py            # Logging utilities
-│   └── factory.py            # Model/trainer factory
-└── results/                   # Output directory
-    ├── runs/                 # Hierarchical experiment results
-    ├── logs/                 # Training logs
-    └── models/               # Model files (symlinks)
+│   ├── factory.py            # Model/trainer factory
+│   └── logging.py            # Logging utilities
+│
+├── scripts/                   # Analysis and debugging scripts
+│   ├── fix_scaler_issue.py   # Scaler consistency fixes
+│   ├── test_prediction.py    # Prediction testing
+│   └── compare_training_inference.py  # Training vs inference comparison
+│
+├── analysis_tools/            # Analysis and visualization tools
+│   ├── performance_comparison_analysis.py
+│   ├── pd_focused_analysis.py
+│   └── interactive_analysis_dashboard.py
+│
+├── docs/                      # Documentation and reports
+│   ├── PREDICTION_GUIDE.md   # Detailed prediction guide
+│   ├── ADDING_NEW_ENCODER.md # Guide for adding new encoders
+│   └── *.png                 # Analysis plots and visualizations
+│
+└── results/                   # Training results and models
+    ├── runs/                 # Hierarchical result storage
+    ├── models/               # Model symlinks
+    └── logs/                 # Training logs
 ```
+
+## 🎯 **Key Features**
+
+### **Training Modes**
+- **Separate**: PK and PD models trained independently
+- **Joint**: PK and PD trained together with shared information
+- **Dual Stage**: PK first, then PD with PK information
+- **Integrated**: PK encoder output used as PD encoder input
+- **Shared**: Common encoder for both PK and PD
+- **Two Stage Shared**: One shared encoder used in two stages
+
+### **Model Architectures**
+- **MLP**: Multi-layer perceptron
+- **ResMLP**: Residual MLP
+- **MoE**: Mixture of Experts
+- **ResMLP-MoE**: Residual MLP with MoE
+- **Adaptive ResMLP-MoE**: Adaptive version
+- **CNN**: Convolutional neural network
+
+### **Advanced Features**
+- **Feature Engineering**: Time windows, per-kg dosing, future dose information
+- **Data Augmentation**: Mixup augmentation
+- **PK/PD Contrastive Learning**: Domain-specific positive/negative pair generation
+  - Temporal continuity (same patient, consecutive time points)
+  - Dose group similarity (same dose group patients)
+  - Feature similarity (data-driven similarity)
+  - Hybrid strategy (combination of above)
+- **Uncertainty Quantification**: Monte Carlo Dropout
+- **Deterministic Splitting**: Consistent data splits across runs
+
+## 🔧 **Configuration**
+
+The system uses a comprehensive configuration system. Key parameters:
+
+```python
+# Training settings
+epochs: int = 3000
+batch_size: int = 32
+learning_rate: float = 1e-3
+patience: int = 300
+
+# Model settings
+encoder: str = "mlp"  # or "resmlp", "moe", etc.
+mode: str = "separate"  # or "joint", "dual_stage", etc.
+
+# Data settings
+use_feature_engineering: bool = False
+use_mixup: bool = False
+use_mc_dropout: bool = False
+```
+
+## 📊 **Data Format**
+
+Input CSV should have the following columns:
+- `ID`: Subject identifier
+- `TIME`: Time point
+- `DV`: Target variable (concentration/effect)
+- `DVID`: Data type (1 for PK, 2 for PD)
+- `BW`: Body weight
+- `COMED`: Concomitant medication
+- `DOSE`: Dose amount
+- `EVID`: Event identifier
+- `MDV`: Missing dependent variable
+- `AMT`: Amount
+- `CMT`: Compartment
+
+## 🎯 **Prediction Output**
+
+The prediction scripts generate CSV files with:
+- `PK_PREDICTION`: Predicted PK values
+- `PD_PREDICTION`: Predicted PD values
+- `PK_STD`, `PD_STD`: Uncertainty estimates (if --uncertainty used)
+- `PK_CI_LOWER`, `PK_CI_UPPER`: Confidence intervals
+- `PD_CI_LOWER`, `PD_CI_UPPER`: Confidence intervals
+
+## 🔍 **Scaler Consistency**
+
+The system includes advanced scaler consistency features by default:
+
+- **Deterministic Data Splitting**: Ensures consistent data splits across runs
+- **Saved Scaler Usage**: Uses exact scalers from training for inference
+- **Consistent Preprocessing**: Same preprocessing pipeline for training and inference
+
+## 📈 **Performance Monitoring**
+
+Training results are saved with comprehensive metrics:
+- RMSE, MAE, R² for both PK and PD
+- Training/validation loss curves
+- Model parameters and architecture info
+- Split information for reproducibility
 
 ## 🛠️ **Installation**
 
-1. **Clone the repository**
 ```bash
-git clone <repository-url>
-cd TeamPNU_exp
-```
-
-2. **Install dependencies**
-```bash
+# Install dependencies
 pip install -r requirements.txt
+
+# Run basic training
+python main.py --mode separate --encoder mlp --epochs 100
+
+# Test prediction functionality
+python scripts/test_prediction.py
 ```
 
-3. **Verify installation**
+## 📚 **Documentation**
+
+- **[Prediction Guide](docs/PREDICTION_GUIDE.md)**: Detailed guide for making predictions
+- **[Adding New Encoders](docs/ADDING_NEW_ENCODER.md)**: Guide for extending the system
+- **[Analysis Reports](docs/)**: Various analysis reports and visualizations
+
+## 🔧 **Troubleshooting**
+
+### **Common Issues**
+
+1. **Data Format Issues**: Ensure CSV has required columns
+2. **CUDA Memory**: Use `--device cpu` for CPU inference
+3. **Feature Mismatch**: Check if feature engineering was used during training
+4. **Model Not Found**: Check model path and directory structure
+
+### **Debugging Tools**
+
+- `scripts/test_prediction.py`: Test prediction functionality
+- `scripts/compare_training_inference.py`: Compare training vs inference results
+- `scripts/fix_scaler_issue.py`: Scaler consistency analysis tools
+
+## 🎯 **Best Practices**
+
+1. **Use Default Scripts**: `main.py` and `predict.py` now include all improvements by default
+2. **Save Split Information**: Always save split info for reproducibility
+3. **Monitor Training**: Check logs and results for training progress
+4. **Validate Predictions**: Test predictions on validation data
+5. **Check Data Format**: Ensure input data matches training data format
+
+## 📊 **Example Workflow**
+
 ```bash
-python -c "import torch; print(f'PyTorch version: {torch.__version__}')"
+# 1. Train a model (now with deterministic splitting by default)
+python main.py --mode separate --encoder mlp --epochs 100
+
+# 2. Test prediction functionality
+python scripts/test_prediction.py
+
+# 3. Make predictions on new data (now with improved consistency by default)
+python predict.py \
+    --model_path results/runs/your_run/separate/mlp/s42 \
+    --data_path data/new_data.csv \
+    --output_path predictions.csv
+
+# 4. Analyze results
+python analysis_tools/performance_comparison_analysis.py
 ```
 
-## 🚀 **Quick Start**
+## 🤝 **Contributing**
 
-### **Basic Training**
-```bash
-# Simple training with default settings
-python main.py
+1. Follow the existing code structure
+2. Add tests for new features
+3. Update documentation
+4. Use deterministic splitting for consistency
 
-# Custom configuration
-python main.py --mode separate --encoder resmlp_moe --epochs 100 --batch_size 32
-```
+## 📄 **License**
 
-### **Advanced Training**
-```bash
-# With feature engineering and mixup
-python main.py --mode shared --encoder resmlp_moe --use_fe --use_mixup --epochs 150
+This project is part of the TeamPNU research initiative.
 
-# Different PK/PD encoders
-python main.py --mode joint --encoder_pk mlp --encoder_pd resmlp --epochs 200
+---
 
-# With contrastive learning
-python main.py --mode separate --encoder resmlp_moe --lambda_contrast 0.1 --epochs 100
-```
-
-### **Custom Run Name**
-```bash
-# Specify custom run name
-python main.py --run_name my_experiment --mode separate --encoder mlp
-```
-
-## ⚙️ **Configuration**
-
-### **Training Modes**
-- `separate`: Train PK and PD models independently
-- `joint`: Train PK/PD models jointly with shared loss
-- `shared`: Use shared encoder with separate heads
-- `dual_stage`: Two-stage training approach
-- `integrated`: Fully integrated PK/PD modeling
-- `two_stage_shared`: Two-stage with shared components
-
-### **Encoders**
-- `mlp`: Standard multi-layer perceptron
-- `resmlp`: Residual MLP with skip connections
-- `moe`: Mixture of Experts
-- `resmlp_moe`: Combined ResMLP and MoE
-- `adaptive_resmlp_moe`: Adaptive mixture of experts
-- `cnn`: Convolutional neural network for sequence data
-
-### **Key Parameters**
-```bash
---mode {separate,joint,shared,dual_stage,integrated,two_stage_shared}
---encoder {mlp,resmlp,moe,resmlp_moe,adaptive_resmlp_moe,cnn}
---encoder_pk ENCODER_PK    # PK-specific encoder
---encoder_pd ENCODER_PD    # PD-specific encoder
---epochs EPOCHS            # Number of training epochs
---batch_size BATCH_SIZE    # Batch size
---lr LEARNING_RATE         # Learning rate
---hidden HIDDEN            # Hidden dimension
---depth DEPTH              # Network depth
---dropout DROPOUT          # Dropout rate
-```
-
-### **Advanced Features**
-```bash
---use_fe                   # Enable feature engineering
---use_mixup                # Enable mixup augmentation
---lambda_contrast LAMBDA   # Contrastive learning weight
---temperature TEMP         # Temperature for contrastive learning
---kernel_size SIZE         # CNN kernel size
---num_filters FILTERS      # Number of CNN filters
-```
-
-## 📊 **Output Structure**
-
-The system creates a hierarchical directory structure for organized experiment management:
-
-```
-results/
-├── runs/
-│   └── {run_name}/
-│       └── {mode}/
-│           └── {encoder} or {encoder_pk-encoder_pd}/
-│               └── s{seed}/
-│                   ├── model.pth          # Trained model
-│                   ├── config.json        # Configuration
-│                   ├── scalers.pkl        # Data scalers
-│                   └── results.json       # Training results
-├── logs/
-│   └── {run_name}/
-│       └── {mode}/
-│           └── {encoder} or {encoder_pk-encoder_pd}/
-│               └── s{seed}/
-│                   └── {run_name}_{timestamp}.log
-└── models/                    # Backward compatibility symlinks
-    └── {mode}/
-        └── {encoder} or {encoder_pk-encoder_pd}/
-            └── s{seed}/
-                └── {run_name}.pth -> ../../runs/{run_name}/{mode}/{encoder}/s{seed}/model.pth
-```
-
-## 📈 **Example Results**
-
-### **Training Output**
-```
-=== PK/PD Modeling ===
-Run name: separate_resmlp_moe_s42_250919_0920_fe_mixup
-Mode: separate | Encoder: resmlp_moe | Epochs: 100
-Batch size: 32 | Learning rate: 0.001
-Device: cuda:0
-
-=== Training Results ===
-Best validation loss: 0.897320
-Best PK RMSE: 0.748186
-Best PD RMSE: 1.075058
-Training time: 46.90 seconds
-
-=== Output Files ===
-Model saved: results/runs/separate_resmlp_moe_s42_250919_0920_fe_mixup/separate/resmlp_moe/s42/model.pth
-Configuration saved: results/runs/separate_resmlp_moe_s42_250919_0920_fe_mixup/separate/resmlp_moe/s42/config.json
-Results saved: results/runs/separate_resmlp_moe_s42_250919_0920_fe_mixup/separate/resmlp_moe/s42/results.json
-```
+**For detailed information, see the documentation in the `docs/` directory.**

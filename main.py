@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-PK/PD Modeling System
+PK/PD Modeling System with Deterministic Data Splitting
+
+This version uses deterministic data splitting to ensure consistent scalers
+across different training runs.
 """
 
 import sys
@@ -10,6 +13,7 @@ from pathlib import Path
 import json
 import pickle
 import os
+import pandas as pd
 
 # Add project root to Python path
 project_root = Path(__file__).parent
@@ -18,13 +22,15 @@ sys.path.insert(0, str(project_root))
 from config import parse_args
 from utils.logging import setup_logging, get_logger
 from data.loaders import load_estdata, use_feature_engineering
-from data.splits import prepare_for_split
 from utils.helpers import scaling_and_prepare_loader, get_device, generate_run_name
 from utils.factory import create_model, create_trainer
+from data.splits import prepare_for_split
+from auto_visualization import AutoVisualizer
+from pathlib import Path
 
 
 def main():
-    """Main function"""
+    """Main function with deterministic data splitting"""
     # Parse configuration
     config = parse_args()
     
@@ -42,7 +48,7 @@ def main():
     
     # Create hierarchical log directory: logs/{run_name}/{mode}/{encoder}/s{seed}/
     if config.run_name:
-        log_dir = f"{config.output_dir}/logs/{config.run_name}/{config.mode}/{encoder_name}/s{config.random_state}"
+        log_dir = f"{config.output_dir}/{config.run_name}/{config.mode}/{encoder_name}/s{config.random_state}/logs"
     else:
         # Fallback to the old structure if no run_name
         log_dir = f"{config.output_dir}/logs/{config.mode}/{encoder_name}/s{config.random_state}"
@@ -54,14 +60,14 @@ def main():
     sys.stdout.flush()
     sys.stderr.flush()
     
-    logger.info("=== PK/PD Modeling ===")
+    logger.info("=== PK/PD Modeling with Deterministic Splitting ===")
     logger.info(f"Run name: {config.run_name}")
     
     # Encoder information
     if config.encoder_pk or config.encoder_pd:
         pk_encoder = config.encoder_pk or config.encoder
         pd_encoder = config.encoder_pd or config.encoder
-        logger.info(    f"Mode: {config.mode} | PK Encoder: {pk_encoder} | PD Encoder: {pd_encoder} | Epochs: {config.epochs}")
+        logger.info(f"Mode: {config.mode} | PK Encoder: {pk_encoder} | PD Encoder: {pd_encoder} | Epochs: {config.epochs}")
     else:
         logger.info(f"Mode: {config.mode} | Encoder: {config.encoder} | Epochs: {config.epochs}")
     
@@ -108,7 +114,7 @@ def main():
     pd_df = df_final[df_final["DVID"] == 2].copy()
     logger.info(f"PK data: {pk_df.shape}, PD data: {pd_df.shape}")
     
-    # Data splitting
+    # Use robust data splitting with multiple strategies
     pk_splits, pd_splits, global_splits, _ = prepare_for_split(
         df_final=df_final, df_dose=df_dose,
         pk_df=pk_df, pd_df=pd_df,
@@ -122,6 +128,7 @@ def main():
     )
     logger.info(f"Data splitting completed - Strategy: {config.split_strategy}")
     
+    # Clean splits structure
     splits = {
         'pk': pk_splits,
         'pd': pd_splits,
@@ -133,22 +140,18 @@ def main():
     # === 4. Data loader creation ===
     logger.info(f"\n=== 4. Data loader creation ===")
     
+    # Optimized device and worker settings
     pin_mem = get_device().type == 'cuda'
-    num_workers = min(4, os.cpu_count() or 1)
     
-    # PK data loader
-    pk_scaler, train_loader_pk, valid_loader_pk, test_loader_pk = scaling_and_prepare_loader(
-        splits['pk'], pk_features, 
-        batch_size=config.batch_size, lambda_ctr=0.0,
-        target_col="DV", num_workers=num_workers, pin_memory=pin_mem, drop_last_train=True
+    # PK data loader (optimized with target scaler)
+    pk_scaler, pk_target_scaler, train_loader_pk, valid_loader_pk, test_loader_pk = scaling_and_prepare_loader(
+        splits['pk'], pk_features, batch_size=config.batch_size, target_col="DV"
     )
     
-    # PD data loader
-    pd_scaler, train_loader_pd, valid_loader_pd, test_loader_pd = scaling_and_prepare_loader(
-        splits['pd'], pd_features, 
-        batch_size=config.batch_size, lambda_ctr=0.0,
-        target_col="DV", num_workers=num_workers, pin_memory=pin_mem, drop_last_train=True
-    )
+    # PD data loader (optimized with target scaler)
+    pd_scaler, pd_target_scaler, train_loader_pd, valid_loader_pd, test_loader_pd = scaling_and_prepare_loader(
+        splits['pd'], pd_features, batch_size=config.batch_size, target_col="DV"
+        )
     
     loaders = {
         "train_pk": train_loader_pk, "val_pk": valid_loader_pk, "test_pk": test_loader_pk,
@@ -179,10 +182,22 @@ def main():
     if config.mode == "separate":
         logger.info(f"PK training completed - Best RMSE: {results['pk']['best_rmse']:.6f}")
         logger.info(f"PD training completed - Best RMSE: {results['pd']['best_rmse']:.6f}")
+        
+        # Log test performance for separate mode
+        if 'test_metrics' in results:
+            test_metrics = results['test_metrics']
+            logger.info(f"Test Performance - PK RMSE: {test_metrics.get('test_pk_rmse', 'N/A'):.6f}, PD RMSE: {test_metrics.get('test_pd_rmse', 'N/A'):.6f}")
+            logger.info(f"Test Performance - PK R²: {test_metrics.get('test_pk_r2', 'N/A'):.6f}, PD R²: {test_metrics.get('test_pd_r2', 'N/A'):.6f}")
     else:
         logger.info(f"Best validation loss: {results['best_val_loss']:.6f}")
         logger.info(f"Best PK RMSE: {results['best_pk_rmse']:.6f}")
         logger.info(f"Best PD RMSE: {results['best_pd_rmse']:.6f}")
+        
+        # Log test performance for other modes
+        if 'test_metrics' in results:
+            test_metrics = results['test_metrics']
+            logger.info(f"Test Performance - PK RMSE: {test_metrics.get('test_pk_rmse', 'N/A'):.6f}, PD RMSE: {test_metrics.get('test_pd_rmse', 'N/A'):.6f}")
+            logger.info(f"Test Performance - PK R²: {test_metrics.get('test_pk_r2', 'N/A'):.6f}, PD R²: {test_metrics.get('test_pd_r2', 'N/A'):.6f}")
     
     # === 7. Results saving ===
     logger.info(f"\n=== 7. Results saving ===")
@@ -196,13 +211,13 @@ def main():
     else:
         encoder_name = config.encoder
     
-    run_dir = f"{config.output_dir}/runs/{config.run_name}/{config.mode}/{encoder_name}/s{config.random_state}"
+    # Unified structure: {run_name}/{mode}/{encoder}/s{random_state}/
+    run_dir = f"{config.output_dir}/{config.run_name}/{config.mode}/{encoder_name}/s{config.random_state}"
     os.makedirs(run_dir, exist_ok=True)
     
     # Model saving
     model_path = f"{run_dir}/model.pth"
     # Temporarily override the trainer's save directory
-    from pathlib import Path
     original_save_dir = trainer.model_save_directory
     trainer.model_save_directory = Path(run_dir)
     trainer.save_model("model.pth")
@@ -215,12 +230,31 @@ def main():
         json.dump(config.__dict__, f, indent=2)
     logger.info(f"Configuration saved: {config_path}")
     
-    # Scaler saving
+    # Scaler saving (now with consistent scalers including target scalers)
     scaler_path = f"{run_dir}/scalers.pkl"
     with open(scaler_path, "wb") as f:
         pickle.dump(pk_scaler, f)
         pickle.dump(pd_scaler, f)
-    logger.info(f"Scaler saved: {scaler_path}")
+        pickle.dump(pk_target_scaler, f)
+        pickle.dump(pd_target_scaler, f)
+    logger.info(f"Consistent scalers (including target scalers) saved: {scaler_path}")
+    
+    # Save split information for reproducibility
+    split_info = {
+        'pk_train_subjects': sorted(pk_splits['train']['ID'].unique().tolist()),
+        'pk_val_subjects': sorted(pk_splits['val']['ID'].unique().tolist()),
+        'pk_test_subjects': sorted(pk_splits['test']['ID'].unique().tolist()),
+        'pd_train_subjects': sorted(pd_splits['train']['ID'].unique().tolist()),
+        'pd_val_subjects': sorted(pd_splits['val']['ID'].unique().tolist()),
+        'pd_test_subjects': sorted(pd_splits['test']['ID'].unique().tolist()),
+        'split_method': 'deterministic',
+        'random_state': config.random_state
+    }
+    
+    split_info_path = f"{run_dir}/split_info.json"
+    with open(split_info_path, "w") as f:
+        json.dump(split_info, f, indent=2)
+    logger.info(f"Split information saved: {split_info_path}")
     
     # Results saving
     results_path = f"{run_dir}/results.json"
@@ -231,7 +265,7 @@ def main():
     # Create symlink for backward compatibility
     try:
         # Create symlinks in the old structure for easy access
-        old_model_path = f"{config.output_dir}/models/{config.mode}/{encoder_name}/s{config.random_state}/{config.run_name}.pth"
+        old_model_path = f"{config.output_dir}/{config.run_name}/{config.mode}/{encoder_name}/s{config.random_state}/model.pth"
         os.makedirs(os.path.dirname(old_model_path), exist_ok=True)
         if not os.path.exists(old_model_path):
             os.symlink(os.path.abspath(model_path), old_model_path)
@@ -241,7 +275,14 @@ def main():
     
     logger.info(f"All outputs saved to: {run_dir}")
     
-    logger.info("=== Execution completed ===")
+    # === 8. Auto Visualization ===
+    logger.info(f"\n=== 8. Auto Visualization ===")
+    
+    visualizer = AutoVisualizer(str(run_dir), device)
+    visualizer.run_auto_visualization()
+    logger.info("✅ Auto Visualization completed!")
+    
+    logger.info("=== Execution completed with deterministic splitting ===")
     return 0
 
 

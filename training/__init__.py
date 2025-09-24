@@ -1,5 +1,5 @@
 """
-Training package
+Training module
 """
 
 from .unified_trainer import UnifiedPKPDTrainer

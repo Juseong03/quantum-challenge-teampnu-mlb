@@ -1,32 +1,20 @@
 """
- Factory functions
+Factory functions for building models and components
+Separates model creation logic to avoid circular imports
 """
-
-from utils.logging import get_logger
-from models.unified_model import UnifiedPKPDModel
-from training.unified_trainer import UnifiedPKPDTrainer
-
-
 def create_model(config, loaders, pk_features, pd_features):
-    """Create unified model"""
-    logger = get_logger(__name__)
-    
-    # Calculate input dimensions
+    """Create model based on configuration"""
+    import importlib
+    from utils.helpers import get_device
+
+    # Lazy import to avoid circular dependency
+    unified_model_module = importlib.import_module('models.unified_model')
+    UnifiedPKPDModel = unified_model_module.UnifiedPKPDModel
+
     pk_input_dim = len(pk_features)
     pd_input_dim = len(pd_features)
-    
-    logger.info(f"Model creation - Mode: {config.mode}")
-    logger.info(f"PK input dimension: {pk_input_dim}, PD input dimension: {pd_input_dim}")
-    
-    # Encoder information logging
-    pk_encoder = config.encoder_pk or config.encoder
-    pd_encoder = config.encoder_pd or config.encoder
-    if pk_encoder != pd_encoder:
-        logger.info(f"Encoder settings - PK: {pk_encoder}, PD: {pd_encoder}")
-    else:
-        logger.info(f"Encoder settings - Common: {pk_encoder}")
-    
-    # Create unified model
+    device = get_device(config.device_id)
+
     model = UnifiedPKPDModel(
         config=config,
         pk_features=pk_features,
@@ -34,24 +22,129 @@ def create_model(config, loaders, pk_features, pd_features):
         pk_input_dim=pk_input_dim,
         pd_input_dim=pd_input_dim
     )
-    
-    logger.info(f"Model creation completed: {type(model).__name__}")
+
     return model
 
-
 def create_trainer(config, model, loaders, device):
-    """Create unified trainer"""
-    logger = get_logger(__name__)
-    
-    logger.info(f"Trainer creation - Mode: {config.mode}")
-    
-    # Create unified trainer
+    """Create trainer based on configuration"""
+    from training.unified_trainer import UnifiedPKPDTrainer
+
     trainer = UnifiedPKPDTrainer(
         model=model,
         config=config,
         data_loaders=loaders,
         device=device
     )
-    
-    logger.info(f"Trainer creation completed: {type(trainer).__name__}")
+
     return trainer
+
+def build_encoder(encoder_type, input_dim, config):
+    """Build encoder"""
+    if encoder_type == "mlp":
+        from models.encoders import MLPEncoder
+        return MLPEncoder(input_dim, config.hidden, config.depth, config.dropout)
+
+    elif encoder_type == "resmlp":
+        from models.encoders import ResMLPEncoder
+        return ResMLPEncoder(input_dim, config.hidden, config.depth, config.dropout)
+
+    elif encoder_type == "moe":
+        from models.encoders import MoEEncoder
+        return MoEEncoder(
+            in_dim=input_dim,
+            hidden_dims=[config.hidden] * config.depth,
+            num_experts=getattr(config, 'num_experts', 8),
+            top_k=getattr(config, 'top_k', 2),
+            dropout=config.dropout
+        )
+
+    elif encoder_type == "resmlp_moe":
+        from models.encoders import ResMLPMoEEncoder
+        encoder = ResMLPMoEEncoder(
+            in_dim=input_dim,
+            hidden_dim=config.hidden,
+            num_layers=config.depth,
+            num_experts=getattr(config, 'num_experts', 8),
+            top_k=getattr(config, 'top_k', 2),
+            mlp_ratio=getattr(config, 'mlp_ratio', 4.0),
+            dropout=config.dropout,
+            activation=getattr(config, 'activation', "gelu")
+        )
+        return encoder
+
+
+    elif encoder_type == "cnn":
+        from models.encoders import CNNEncoder
+        return CNNEncoder(
+            in_dim=input_dim,
+            hidden=config.hidden,
+            depth=config.depth,
+            dropout=config.dropout,
+            kernel_size=getattr(config, 'kernel_size', 3),
+            num_filters=getattr(config, 'num_filters', 64)
+        )
+
+    elif encoder_type == "qmlp":
+        from models.encoders import QMLPEncoder
+        return QMLPEncoder(
+            in_dim=input_dim,
+            hidden=config.hidden,
+            depth=config.depth,
+            dropout=config.dropout,
+            n_qubits=getattr(config, 'n_qubits', 4),
+            n_layers=getattr(config, 'qnn_layers', 2)
+        )
+
+    elif encoder_type == "qresmlp":
+        from models.encoders import QResMLPEncoder
+        return QResMLPEncoder(
+            in_dim=input_dim,
+            hidden=config.hidden,
+            num_layers=config.depth,
+            dropout=config.dropout,
+            n_qubits=getattr(config, 'n_qubits', 4),
+            n_layers=getattr(config, 'qnn_layers', 2)
+        )
+
+    elif encoder_type == "qmoe":
+        from models.encoders import QMoEEncoder
+        return QMoEEncoder(
+            in_dim=input_dim,
+            hidden=[config.hidden] * config.depth,
+            num_experts=getattr(config, 'num_experts', 4),
+            top_k=getattr(config, 'top_k', 2),
+            dropout=config.dropout,
+            activation=getattr(config, 'activation', "relu"),
+            n_qubits=getattr(config, 'n_qubits', 4),
+            n_layers=getattr(config, 'qnn_layers', 1)
+        )
+
+    elif encoder_type == "qresmlp_moe":
+        from models.encoders import QResMLPMoEEncoder
+        return QResMLPMoEEncoder(
+            in_dim=input_dim,
+            hidden=config.hidden,
+            num_layers=config.depth,
+            activation=getattr(config, 'activation', "gelu"),
+            num_experts=getattr(config, 'num_experts', 8),
+            top_k=getattr(config, 'top_k', 2),
+            dropout=config.dropout,
+            n_qubits=getattr(config, 'n_qubits', 4),
+            n_layers=getattr(config, 'qnn_layers', 2)
+        )
+
+    else:
+        # Fallback to MLP for unknown encoders
+        from models.encoders import MLPEncoder
+        return MLPEncoder(input_dim, config.hidden, config.depth, config.dropout)
+
+def build_head(head_type, hidden_dim, config=None):
+    """Build head"""
+    if head_type == "mse":
+        from models.heads import MSEHead
+        dropout_rate = config.mc_dropout_rate if config and config.use_mc_dropout else 0.0
+        return MSEHead(hidden_dim, dropout_rate)
+    else:
+        from models.heads import MSEHead
+        dropout_rate = config.mc_dropout_rate if config and config.use_mc_dropout else 0.0
+        return MSEHead(hidden_dim, dropout_rate)

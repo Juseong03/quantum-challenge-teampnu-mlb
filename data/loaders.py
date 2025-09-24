@@ -128,7 +128,9 @@ def features_from_dose_history(
     add_pd_delta: bool = False,   
     target: str = "dv",           
     allow_future_dose: bool = False,
-    time_windows: list = None  # New parameter for custom time windows
+    time_windows: list = None,
+    add_decay_features: bool = True,
+    half_lives: list = [24, 48, 72]   # hours
 ) -> pd.DataFrame:
     required_obs = {"ID", "TIME", "DV", "DVID"}
     required_dose = {"ID", "TIME", "AMT"}
@@ -160,9 +162,11 @@ def features_from_dose_history(
     
     # Dynamic window sum lists
     window_sum_lists = {f"sum{int(w)}h": [] for w in optimal_windows}
+    # Decay feature lists
+    decay_lists = {f"DECAY_HL{hl}h": [] for hl in half_lives} if add_decay_features else {}
 
     def window_sum(d_times, csum, t_start, t_end):
-        """Cumulative dose in the window (t_start, t_end], inclusive on right."""
+        """Cumulative dose in the window (t_start, t_end], inclusive on right)."""
         r = np.searchsorted(d_times, t_end, side="right") - 1
         l = np.searchsorted(d_times, t_start, side="right") - 1
         if r < 0:
@@ -181,10 +185,11 @@ def features_from_dose_history(
             ndose_list += [0] * n
             cumdose_list += [0.0] * n
             ttnext_list += [np.nan] * n
-            
-            # Initialize all window sum lists with zeros
             for window_key in window_sum_lists:
                 window_sum_lists[window_key] += [0.0] * n
+            if add_decay_features:
+                for key in decay_lists:
+                    decay_lists[key] += [0.0] * n
             continue
 
         dmat = dose_by_id[i]
@@ -217,11 +222,18 @@ def features_from_dose_history(
             else:
                 ttnext = np.nan
 
-            # rolling dose sums over past windows (dynamic)
+            # rolling dose sums
             for window in optimal_windows:
                 window_key = f"sum{int(window)}h"
                 window_sum_value = window_sum(d_times, csum, t - window, t)
                 window_sum_lists[window_key].append(window_sum_value)
+
+            # decay features
+            if add_decay_features:
+                for hl in half_lives:
+                    k = np.log(2) / hl
+                    decay_val = np.exp(-k * tsld) if tsld == tsld else 0.0
+                    decay_lists[f"DECAY_HL{hl}h"].append(decay_val)
 
             tsld_list.append(tsld)
             last_amt_list.append(last_amt)
@@ -234,36 +246,43 @@ def features_from_dose_history(
     out["LAST_DOSE_AMT"] = last_amt_list
     out["N_DOSES_UP_TO_T"] = ndose_list
     out["CUM_DOSE_UP_TO_T"] = cumdose_list
-    out["TIME_TO_NEXT_DOSE"] = ttnext_list  # may be NaN if allow_future_dose=False
-    
-    # Assign dynamic window sum columns
+    out["TIME_TO_NEXT_DOSE"] = ttnext_list
+    out["LAST_DOSE_TIME"] = out["TIME"] - out["TSLD"]
+
+    # TIME transformations
+    print("  + TIME feature enhancement applied (essential transformations)")
+    out["TIME_SQUARED"] = out["TIME"] ** 2
+    out["TIME_LOG"] = np.log1p(out["TIME"])
+
+    # Window sum features
     for window_key, window_values in window_sum_lists.items():
-        # Extract hour value from key (e.g., "sum24h" -> "24H")
         hour_value = window_key.replace("sum", "").replace("h", "H")
         column_name = f"DOSE_SUM_PREV{hour_value}"
         out[column_name] = window_values
 
-    # Baselines: computed as first DV per (ID, DVID) after sorting by time
+    # Decay features
+    if add_decay_features:
+        for col, vals in decay_lists.items():
+            out[col] = vals
+            print(f"  + decay feature added: {col}")
+
+    # Baselines
     base_by_id_dvid = (
         out.sort_values(["ID", "TIME"])
            .groupby(["ID", "DVID"])["DV"]
            .transform(lambda s: s.iloc[0] if len(s) else np.nan)
     )
-
-    # PD baseline/delta removed to avoid data leakage for new participants
-    # PD_BASELINE causes data leakage as it requires future knowledge of participant's first measurement
     if add_pd_delta:
-        # For delta target, we need baseline - but this should be used carefully
         out["PD_BASELINE"] = np.where(out["DVID"].eq(2), base_by_id_dvid, np.nan)
         out["PD_DELTA"] = np.where(out["DVID"].eq(2), out["DV"] - out["PD_BASELINE"], np.nan)
         print("WARNING: PD_DELTA target uses PD_BASELINE which may cause data leakage!")
 
-    # Optional PK baseline/delta only on PK rows (DVID==1) — not used as features by default
     if add_pk_baseline:
         out["PK_BASELINE"] = np.where(out["DVID"].eq(1), base_by_id_dvid, np.nan)
         out["PK_DELTA"] = np.where(out["DVID"].eq(1), out["DV"] - out["PK_BASELINE"], np.nan)
 
     return out
+
 
 
 def add_population_baseline(df_obs: pd.DataFrame, baseline_type: str = "median", baseline_value: float = None) -> pd.DataFrame:
@@ -340,54 +359,56 @@ def use_feature_engineering(
     df_dose: pd.DataFrame,
     use_perkg: bool,
     *,
-    target: str = "dv", # 'dv' or 'delta'
+    target: str = "dv",
     allow_future_dose: bool = False,
-    time_windows: list = None  # New parameter for custom time windows
+    time_windows: list = None,
+    add_decay_features: bool = True,
+    half_lives: list = [24, 48, 72]
 ):
-    """
-    Build engineered dataframe and return (df_final, pk_features, pd_features).
-    """
     print("applying feature engineering (leakage-safe).")
     df_final = features_from_dose_history(
         obs_df=df_obs,
         dose_df=df_dose,
         add_pk_baseline=False,
-        add_pd_delta=(str(target).lower() == "delta"),   # compute PD_DELTA only if target='delta'
+        add_pd_delta=(str(target).lower() == "delta"),
         target=target,
         allow_future_dose=allow_future_dose,
-        time_windows=time_windows  # Pass time windows parameter
+        time_windows=time_windows,
+        add_decay_features=add_decay_features,
+        half_lives=half_lives
     )
 
-    # Base feature pool (no target columns here)
     base_feats = [
         'BW', 'COMED', 'DOSE', 'TIME',
-        'TSLD', 'LAST_DOSE_AMT', 'N_DOSES_UP_TO_T', 'CUM_DOSE_UP_TO_T'
+        'TSLD', 'LAST_DOSE_TIME', 'LAST_DOSE_AMT',
+        'N_DOSES_UP_TO_T', 'CUM_DOSE_UP_TO_T',
+        'TIME_SQUARED', 'TIME_LOG'
     ]
-    
-    # Add dynamic window sum features (extract from df_final columns)
-    window_features = [col for col in df_final.columns if col.startswith('DOSE_SUM_PREV') and col.endswith('H')]
+
+    # Add window features
+    window_features = [col for col in df_final.columns if col.startswith('DOSE_SUM_PREV')]
     base_feats.extend(window_features)
     print(f"  + window features added: {window_features}")
-    
+
+    # Add decay features
+    if add_decay_features:
+        decay_features = [col for col in df_final.columns if col.startswith('DECAY_HL')]
+        base_feats.extend(decay_features)
+        print(f"  + decay features added: {decay_features}")
+
     if allow_future_dose:
         base_feats.append('TIME_TO_NEXT_DOSE')
 
     pk_features = base_feats.copy()
     pd_features = base_feats.copy()
 
-    # PD_BASELINE removed to avoid data leakage for new participants
-    # Use other features like BW, COMED, DOSE, TIME, TSLD, etc. instead
     print("PD_BASELINE feature removed to prevent data leakage for new participants.")
-    print("Using other available features: BW, COMED, DOSE, TIME, TSLD, dose history, etc.")
     
-    # Optional per-kg features for both PK/PD
+    # Optional per-kg features
     if use_perkg:
         bw = df_final['BW'].replace(0, np.nan)
         perkg_cols = ['DOSE', 'LAST_DOSE_AMT', 'CUM_DOSE_UP_TO_T']
-        
-        # Add dynamic window sum columns to per-kg features
         perkg_cols.extend(window_features)
-        
         added = []
         for col in perkg_cols:
             if col in df_final.columns:
