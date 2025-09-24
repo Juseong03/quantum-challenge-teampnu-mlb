@@ -136,7 +136,9 @@ def create_argument_parser() -> argparse.ArgumentParser:
     
     # === Model settings ===
     parser.add_argument("--encoder", 
-                       choices=["mlp", "resmlp", "moe", "resmlp_moe", "cnn", "qmlp", "qresmlp", "qmoe", "qresmlp_moe"],  
+                       choices=["mlp", "resmlp", "moe", "resmlp_moe", "cnn", "qmlp", "qresmlp", "qmoe", "qresmlp_moe",
+                                "qnn", "resqnn_moe",
+                                ],  
                        default="mlp", help="Default encoder type")
     parser.add_argument("--encoder_pk", 
                        choices=["mlp", "resmlp", "moe", "resmlp_moe", "cnn", "qmlp", "qresmlp", "qmoe", "qresmlp_moe"], 

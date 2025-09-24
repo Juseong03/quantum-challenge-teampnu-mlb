@@ -132,6 +132,26 @@ def build_encoder(encoder_type, input_dim, config):
             n_qubits=getattr(config, 'n_qubits', 4),
             n_layers=getattr(config, 'qnn_layers', 2)
         )
+      
+    elif encoder_type == "qnn":
+        from models.encoders import QNNEncoder
+        return QNNEncoder(
+                    input_dim, config.hidden, config.depth, config.dropout,
+                    n_qubits=getattr(config, 'n_qubits', 4),
+                    n_layers=getattr(config, 'qnn_layers', 2)
+            )
+      
+    elif encoder_type == 'resqnn_moe':
+        from models.encoders import ResQNNMoEEncoder
+        return ResQNNMoEEncoder(
+            in_dim=input_dim,
+            hidden_dim=config.hidden,
+            num_layers=config.depth,
+            num_experts=getattr(config, 'num_experts', 8),
+            top_k=getattr(config, 'top_k', 2),
+            n_qubits=getattr(config, 'n_qubits', 4),
+            n_layers=getattr(config, 'qnn_layers', 2)
+        )
 
     else:
         # Fallback to MLP for unknown encoders

@@ -16,7 +16,7 @@ from config import Config
 # ==========================================================
 # Load model & scalers
 # ==========================================================
-model_path = Path("results/baseline/shared/resmlp/s42")
+model_path = Path("results/full1/dual_stage/mlp/s1")
 config_path = model_path / "config.json"
 scaler_path = model_path / "scalers.pkl"
 
@@ -49,7 +49,7 @@ model.to(device).eval()
 print(f"✅ Model loaded: {config.mode} mode, {config.encoder} encoder")
 print(f"📊 Input features: {len(pk_features)}")
 
-from fe_module import features_from_dose_history, use_feature_engineering  # <-- FE 코드 import
+from data.loaders import features_from_dose_history, use_feature_engineering  # <-- FE 코드 import  
 
 # ==========================================================
 # Feature builder using new FE pipeline
@@ -60,30 +60,34 @@ def create_test_batch(dose_schedule, time, bw=75, comed=0, batch_size=1):
     dose_schedule: list of (t, amt)
     time: evaluation time
     """
-    # 가짜 observation row (target DV 없음, dummy)
     obs = pd.DataFrame([{
-        "ID": 1, "TIME": time, "DV": 0.0, "DVID": 2,  # PD row
-        "BW": bw, "COMED": comed, "DOSE": dose_schedule[-1][1] if dose_schedule else 0.0
+        "ID": 1, "TIME": time, "DV": 0.0, "DVID": 2,
+        "BW": bw, "COMED": comed,
+        "DOSE": dose_schedule[-1][1] if dose_schedule else 0.0
     }])
     dose = pd.DataFrame([{"ID": 1, "TIME": t, "AMT": a} for t, a in dose_schedule])
 
-    # FE 적용
-    fe_out = features_from_dose_history(obs, dose,
-                                        add_pk_baseline=False,
-                                        add_pd_delta=False,
-                                        target="dv",
-                                        allow_future_dose=False,
-                                        time_windows=None,
-                                        add_decay_features=True,
-                                        half_lives=[24,48,72])
-    X = fe_out.drop(columns=["DV","DVID","ID"], errors="ignore").values
-    X_scaled = pk_scaler.transform(X)  # scaler 동일하게 적용
+    fe_out = features_from_dose_history(
+        obs, dose,
+        add_pk_baseline=False,
+        add_pd_delta=False,
+        target="dv",
+        allow_future_dose=False,
+        time_windows=None,
+        add_decay_features=True,
+        half_lives=[24,48,72]
+    )
+
+    # ✅ 반드시 학습 당시의 feature 리스트와 동일하게 선택
+    X = fe_out[pk_features].values  
+    X_scaled = pk_scaler.transform(X)
     X_tensor = torch.FloatTensor(X_scaled).to(device)
 
     return {
         "pk": {"x": X_tensor, "y": torch.zeros(batch_size, 1).to(device)},
         "pd": {"x": X_tensor, "y": torch.zeros(batch_size, 1).to(device)},
     }
+
 
 
 # ==========================================================

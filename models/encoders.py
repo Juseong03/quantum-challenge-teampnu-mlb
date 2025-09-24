@@ -11,6 +11,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pennylane as qml
 
+from .qml import qnn_basic
+
 
 # =========================
 # Pooling Layer
@@ -954,3 +956,303 @@ class QResMLPMoEEncoder(BaseEncoder):
 
         x = self.output_proj(x)
         return x, total_aux_loss
+
+
+# =========================
+# Factory Functions
+# =========================
+def create_encoder(
+    encoder_type: str,
+    in_dim: int,
+    hidden: int = 256,
+    depth: int = 3,
+    **kwargs
+) -> BaseEncoder:
+    """
+    Unified factory function to create any encoder type
+    
+    Args:
+        encoder_type: Type of encoder ("mlp", "resmlp", "moe", "resmlp_moe", "qmlp", "qresmlp", "qmoe", "qresmlp_moe", "cnn")
+        in_dim: Input dimension
+        hidden_dim: Hidden dimension
+        **kwargs: Additional arguments for specific encoder types
+    """
+    if encoder_type == "mlp":
+        return MLPEncoder(in_dim=in_dim, hidden=hidden, **kwargs)
+    elif encoder_type == "resmlp":
+        return ResMLPEncoder(in_dim=in_dim, hidden=hidden, **kwargs)
+    elif encoder_type == "moe":
+        return MoEEncoder(in_dim=in_dim, hidden=[hidden], **kwargs)
+    elif encoder_type == "resmlp_moe":
+        return ResMLPMoEEncoder(in_dim=in_dim, hidden=hidden, **kwargs)
+    elif encoder_type == "qmlp":
+        return QMLPEncoder(in_dim=in_dim, hidden=hidden, **kwargs)
+    elif encoder_type == "qresmlp":
+        return QResMLPEncoder(in_dim=in_dim, hidden=hidden, **kwargs)
+    elif encoder_type == "qmoe":
+        return QMoEEncoder(in_dim=in_dim, hidden=[hidden] * depth, **kwargs)
+    elif encoder_type == "qresmlp_moe":
+        return QResMLPMoEEncoder(in_dim=in_dim, hidden=hidden, **kwargs)
+    elif encoder_type == "cnn":
+        return CNNEncoder(in_dim=in_dim, hidden=hidden, **kwargs)
+    else:
+        raise ValueError(f"Unknown encoder type: {encoder_type}. Choose from 'mlp', 'resmlp', 'moe', 'resmlp_moe', 'qmlp', 'qresmlp', 'qmoe', 'qresmlp_moe', 'cnn'")
+
+
+## Quantum Models
+
+class QNNEncoder(BaseEncoder):
+    def __init__(
+        self,
+        in_dim: int,
+        hidden: int = 256,
+        depth: int = 3,
+        dropout: float = 0.1,
+        time_pool: str = None,  # "mean"/"max"/"attn"/None
+        use_input_ln: bool = False,
+        n_qubits=8, n_layers=2
+    ):
+        super().__init__()
+        self.in_dim = in_dim
+        self.time_pool = time_pool
+
+        if time_pool in ["mean", "max", "min", "attn"]:
+            self.pooling = Pooling(in_dim, hidden, mode=time_pool)
+            d = hidden
+        else:
+            self.pooling = None
+            d = in_dim
+
+        layers = []
+        if use_input_ln:
+            layers.append(nn.LayerNorm(d))
+        for _ in range(depth):
+            layers += [qnn_basic(d, hidden, n_qubits, n_layers), nn.ReLU(), nn.Dropout(dropout)]
+            d = hidden
+        self.net = nn.Sequential(*layers) if layers else nn.Identity()
+        self.out_dim = d
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() == 3:
+            x = self.pooling(x) # [B, N, F] -> [B, F]
+        return self.net(x) # [B, F] -> [B, H]
+    
+class ResidualQNNBlock(nn.Module):
+    """Advanced Residual MLP Block with LayerNorm and Dropout"""
+    
+    def __init__(
+        self,
+        hidden_dim: int,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.1,
+        activation: str = "gelu",
+        n_qubits=8, n_layers=2
+    ):
+        super().__init__()   
+        
+        self.hidden_dim = hidden_dim
+        self.mlp_ratio = mlp_ratio
+        self.dropout = dropout
+        
+        # Layer normalization
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        
+        # MLP layers
+        mlp_hidden = int(hidden_dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            qnn_basic(hidden_dim, mlp_hidden, n_qubits, n_layers),
+            self._get_activation(activation),
+            nn.Dropout(dropout),
+            qnn_basic(mlp_hidden, hidden_dim, n_qubits, n_layers),
+            nn.Dropout(dropout)
+        )
+        
+        # Dropout for residual connection
+        self.dropout_layer = nn.Dropout(dropout)
+    
+    def _get_activation(self, activation: str):
+        if activation.lower() == "gelu":
+            return nn.GELU()
+        elif activation.lower() == "relu":
+            return nn.ReLU()
+        elif activation.lower() == "swish":
+            return nn.SiLU()
+        else:
+            return nn.GELU()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Pre-norm residual connection
+        residual = x
+        x = self.norm1(x)
+        x = self.mlp(x)
+        x = self.dropout_layer(x)
+        x = x + residual
+        
+        # Second residual connection
+        residual = x
+        x = self.norm2(x)
+        return x + residual
+
+class ResQNNMoEBlock(nn.Module):
+    """Combined ResQNN + Advanced MoE Block"""
+    
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_experts: int = 8,
+        top_k: int = 2,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.1,
+        activation: str = "gelu",
+        n_qubits: int = 8, 
+        n_layers: int = 2
+    ):
+        super().__init__()
+        
+        self.resmlp = ResidualQNNBlock(
+            hidden_dim=hidden_dim,
+            mlp_ratio=mlp_ratio,
+            dropout=dropout,
+            activation=activation,
+            n_qubits=n_qubits, 
+            n_layers=n_layers
+        )
+        
+        self.moe = AdvancedMoEBlock(
+            hidden_dim=hidden_dim,
+            num_experts=num_experts,
+            top_k=top_k,
+            dropout=dropout
+        )
+        
+        # Final layer norm
+        self.norm = nn.LayerNorm(hidden_dim)
+    
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # ResMLP processing
+        x = self.resmlp(x)
+        
+        # MoE processing
+        x, aux_loss = self.moe(x)
+        
+        # Final normalization
+        x = self.norm(x)
+        
+        return x, aux_loss
+    
+
+    
+class ResQNNMoEEncoder(BaseEncoder):
+    """
+    Advanced ResQNN + MoE Hybrid Encoder
+    Transformer-like stacking: [ResMLP->MoE]->[ResMLP->MoE]->[ResMLP->MoE]
+    """
+    
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int = 256,
+        num_layers: int = 6,
+        num_experts: int = 8,
+        top_k: int = 2,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.1,
+        activation: str = "gelu",
+        time_pool: Optional[str] = None,  # "mean"/"max"/"attn"/None
+        use_input_projection: bool = True,
+        use_output_projection: bool = True,
+        n_qubits: int = 8, 
+        n_layers: int = 2
+    ):
+        super().__init__()
+        
+        self.in_dim = in_dim
+        self.hidden_dim = hidden_dim
+        self.out_dim = hidden_dim
+        self.num_layers = num_layers
+        self.time_pool = time_pool
+        
+        # Input projection
+        if use_input_projection:
+            self.input_proj = nn.Sequential(
+                nn.Linear(in_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.Dropout(dropout)
+            )
+        else:
+            self.input_proj = nn.Identity()
+        
+        # ResMLP + MoE blocks
+        self.blocks = nn.ModuleList([
+            ResQNNMoEBlock(
+                hidden_dim=hidden_dim,
+                num_experts=num_experts,
+                top_k=top_k,
+                mlp_ratio=mlp_ratio,
+                dropout=dropout,
+                activation=activation,
+                n_qubits=n_qubits,
+                n_layers=n_layers
+            ) for _ in range(num_layers)
+        ])
+        
+        # Time pooling (if needed)
+        if time_pool in ["mean", "max", "min", "attn"]:
+            if time_pool == "attn":
+                self.pooling = nn.Sequential(
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.Tanh(),
+                    nn.Linear(hidden_dim, 1),
+                    nn.Softmax(dim=1)
+                )
+            else:
+                self.pooling = time_pool
+        else:
+            self.pooling = None
+        
+        # Output projection
+        if use_output_projection:
+            self.output_proj = nn.Sequential(
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.Dropout(dropout)
+            )
+        else:
+            self.output_proj = nn.Identity()
+    
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: [batch_size, seq_len, in_dim] or [batch_size, in_dim]
+        Returns:
+            output: [batch_size, hidden_dim] or [batch_size, seq_len, hidden_dim]
+            total_aux_loss: total auxiliary loss from all MoE blocks
+        """
+        # Input projection
+        x = self.input_proj(x)
+        
+        # Process through ResMLP + MoE blocks
+        total_aux_loss = 0.0
+        for block in self.blocks:
+            x, aux_loss = block(x)
+            total_aux_loss += aux_loss
+        
+        # Time pooling (if needed)
+        if self.pooling is not None and x.dim() == 3:
+            if self.pooling == "mean":
+                x = x.mean(dim=1)
+            elif self.pooling == "max":
+                x = x.max(dim=1).values
+            elif self.pooling == "min":
+                x = x.min(dim=1).values
+            elif isinstance(self.pooling, nn.Module):
+                # Attention pooling
+                weights = self.pooling(x)  # [batch_size, seq_len, 1]
+                x = (x * weights).sum(dim=1)  # [batch_size, hidden_dim]
+        
+        # Output projection
+        x = self.output_proj(x)
+        
+        return x, total_aux_loss
+    
