@@ -60,6 +60,7 @@ class AutoVisualizer:
         self.scalers_path = self.run_dir / "scalers.pkl"
         self.split_info_path = self.run_dir / "split_info.json"
         self.results_path = self.run_dir / "results.json"
+        self.features_path = self.run_dir / "features.pkl"
         
         # Loaded data
         self.config = None
@@ -102,26 +103,34 @@ class AutoVisualizer:
     def load_model(self):
         """Loading model"""
         print(" Loading model...")
-        
-        # Model state load
-        model_state = torch.load(self.model_path, map_location=self.device)
-        
-        # Model is saved in state_dict format
-        if isinstance(model_state, dict) and 'model_state_dict' in model_state:
-            # Use the entire model object if it exists (for AutoVisualizer)
-            if 'model' in model_state:
-                self.model = model_state['model']
-                print(f"    Use the entire model object (for AutoVisualizer compatibility)")
-            else:
-                # Only state_dict is available
-                self.model = model_state['model_state_dict']
-                print(f"    State dict model extracted")
-                print(f"    State dict model cannot be used directly in AutoVisualizer.")
-                return
+
+        from config import Config
+        cfg = Config()
+        for k, v in self.config.items():
+            if hasattr(cfg, k):
+                setattr(cfg, k, v)
+
+        from utils.factory import create_model
+
+        with open(self.features_path, "rb") as f:
+            feats = pickle.load(f)
+        pk_feats = feats["pk"]
+        pd_feats = feats["pd"]
+
+        # 모델 생성
+        self.model = create_model(cfg, None, pk_feats, pd_feats)
+
+        # state_dict 불러오기
+        checkpoint = torch.load(self.model_path, map_location=self.device)
+        if "model_state_dict" in checkpoint:
+            self.model.load_state_dict(checkpoint["model_state_dict"])
+            print("    Loaded model state_dict")
         else:
-            self.model = model_state
-        
-        print(f"    Model loaded")
+            self.model.load_state_dict(checkpoint)
+            print("    Loaded model weights")
+
+        self.model.to(self.device).eval()
+        print(f"    Model ready on {self.device}")
         
     def prepare_test_data(self):
         """Preparing test data"""
@@ -131,20 +140,19 @@ class AutoVisualizer:
         df_all, df_obs, df_dose = load_estdata(self.config['csv_path'])
         
         # Feature engineering applied
-        if self.config.get('use_feature_engineering', False):
-            df_final, pk_features, pd_features = use_feature_engineering(
-                df_obs=df_obs, df_dose=df_dose,
-                use_perkg=self.config.get('perkg', True),
+        if self.config.get('use_fe', False):
+            df_final, pk_feats, pd_feats = use_feature_engineering(
+                df_obs=df_obs, 
+                df_dose=df_dose,
+                use_perkg=self.config.get('use_perkg', False),
                 target="dv",
                 allow_future_dose=self.config.get('allow_future_dose', True),
                 time_windows=self.config.get('time_windows', [24, 48, 72, 96, 120, 144, 168])
             )
         else:
             df_final = df_obs.copy()
-            feature_cols = [col for col in df_final.columns 
-                          if col not in ['ID', 'TIME', 'DV', 'DVID']]
-            pk_features = feature_cols
-            pd_features = feature_cols
+            pk_feats = ['BW', 'COMED', 'DOSE', 'TIME']
+            pd_feats = ['BW', 'COMED', 'DOSE', 'TIME']
         
         # PK/PD data separation
         pk_df = df_final[df_final["DVID"] == 1].copy()
@@ -160,100 +168,60 @@ class AutoVisualizer:
         print(f"   PK Test data: {pk_test_data.shape}")
         print(f"   PD Test data: {pd_test_data.shape}")
         
-        return pk_test_data, pd_test_data, pk_features, pd_features
+        return pk_test_data, pd_test_data, pk_feats, pd_feats
     
     def make_predictions(self, test_data, features, target_scaler, data_type):
-        """Making predictions"""
+        """Making predictions with optional MC Dropout"""
         print(f" {data_type.upper()} prediction...")
-        
-        # Feature data preparation
+
         X = test_data[features].values
         y_true = test_data['DV'].values
-        
-        # Scaling
-        if data_type == 'pk':
-            scaler = self.scalers['pk_scaler']
-        else:
-            scaler = self.scalers['pd_scaler']
-        
+
+        # 입력 스케일링
+        scaler = self.scalers['pk_scaler'] if data_type == 'pk' else self.scalers['pd_scaler']
         X_scaled = scaler.transform(X)
-        
-        # Tensor conversion
+
+        # Tensor 변환
         X_tensor = torch.FloatTensor(X_scaled).to(self.device)
-        y_tensor = torch.FloatTensor(y_true).to(self.device)
-        
-        # Prediction
-        with torch.no_grad():
-            if hasattr(self.model, 'pk_model') and hasattr(self.model, 'pd_model'):
-                # UnifiedPKPDModel in separate mode
-                if data_type == 'pk':
-                    # PK model: encoder -> head sequentially
-                    encoded = self.model.pk_model['encoder'](X_tensor)
-                    # MSEHead requires batch argument, so pass empty dictionary
-                    head_output = self.model.pk_model['head'](encoded, {})
-                    predictions = head_output['pred'].cpu().numpy().flatten()
-                elif data_type == 'pd':
-                    # PD model: first calculate PK prediction result and add to PD input
-                    # 1. PK prediction
-                    pk_encoded = self.model.pk_model['encoder'](X_tensor)
-                    pk_head_output = self.model.pk_model['head'](pk_encoded, {})
-                    pk_pred = pk_head_output['pred']
-                    
-                    # 2. PK prediction result to PD input (add to last dimension)
-                    pd_input = torch.cat([X_tensor, pk_pred.unsqueeze(-1)], dim=-1)
-                    
-                    # 3. PD model: encoder -> head sequentially
-                    encoded = self.model.pd_model['encoder'](pd_input)
-                    # MSEHead requires batch argument, so pass empty dictionary
-                    head_output = self.model.pd_model['head'](encoded, {})
-                    predictions = head_output['pred'].cpu().numpy().flatten()
-                else:
-                    raise ValueError(f"Unknown data_type: {data_type}")
-            elif isinstance(self.model, dict):
-                # Model is a dictionary
-                model = self.model[data_type]
-                predictions = model(X_tensor).cpu().numpy().flatten()
-            else:
-                # Model is a single model - check if it's dual_stage mode
-                if hasattr(self.model, 'mode') and self.model.mode == 'dual_stage':
-                    # For dual_stage mode, create proper batch dictionary
-                    batch_dict = {}
-                    if data_type == 'pk':
-                        batch_dict['pk'] = {'x': X_tensor, 'y': y_tensor}
-                    elif data_type == 'pd':
-                        batch_dict['pd'] = {'x': X_tensor, 'y': y_tensor}
-                    
-                    results = self.model(batch_dict)
-                    if data_type == 'pk':
-                        predictions = results['pk']['pred'].cpu().numpy().flatten()
-                    elif data_type == 'pd':
-                        predictions = results['pd']['pred'].cpu().numpy().flatten()
-                else:
-                    # Regular model call - create proper batch format
-                    batch_dict = {'x': X_tensor, 'y': y_tensor}
-                    if data_type == 'pk':
-                        batch_dict = {'pk': batch_dict}
-                    elif data_type == 'pd':
-                        batch_dict = {'pd': batch_dict}
-                    
-                    results = self.model(batch_dict)
-                    if data_type == 'pk':
-                        predictions = results['pk']['pred'].cpu().numpy().flatten()
-                    elif data_type == 'pd':
-                        predictions = results['pd']['pred'].cpu().numpy().flatten()
-        
-        # Inverse transformation
-        y_pred = target_scaler.inverse_transform(predictions.reshape(-1, 1)).flatten()
-        
-        # Create result dataframe
+        y_tensor = torch.zeros((len(y_true), 1)).to(self.device)  # dummy y
+
+        # ---------- MC Dropout ON ----------
+        if self.config.get("use_mc_dropout", False):
+            n_samples = self.config.get("mc_dropout_samples", 50)  # 기본 50회 샘플링
+            preds_mc = []
+
+            self.model.train()  # 중요: dropout을 활성화해야 함!
+            with torch.no_grad():
+                for _ in range(n_samples):
+                    out = self.model({data_type: {'x': X_tensor, 'y': y_tensor}})
+                    preds_mc.append(out[data_type]['pred'].cpu().numpy())
+
+            preds_mc = np.stack(preds_mc, axis=0)  # [n_samples, N, 1]
+            preds_mean = preds_mc.mean(axis=0).flatten()
+            preds_std = preds_mc.std(axis=0).flatten()  # 불확실성
+
+            # 역스케일링
+            y_pred = target_scaler.inverse_transform(preds_mean.reshape(-1, 1)).flatten()
+            y_std = target_scaler.scale_[0] * preds_std  # std도 역스케일링
+        # ---------- MC Dropout OFF ----------
+        else:
+            self.model.eval()
+            with torch.no_grad():
+                preds = self.model({data_type: {'x': X_tensor, 'y': y_tensor}})[data_type]['pred']
+            y_pred = target_scaler.inverse_transform(preds.cpu().numpy().reshape(-1, 1)).flatten()
+            y_std = None
+
+        # 결과 dataframe
         results_df = test_data[['ID', 'TIME', 'DV']].copy()
         results_df['PRED'] = y_pred
-        results_df['ERROR'] = y_pred - y_true
-        results_df['ABS_ERROR'] = np.abs(results_df['ERROR'])
-        
+        results_df['ERROR'] = results_df['PRED'] - results_df['DV']
+        results_df['ABS_ERROR'] = results_df['ERROR'].abs()
+        if y_std is not None:
+            results_df['UNCERTAINTY'] = y_std  # MC Dropout 불확실성 추가
+
         print(f"    {data_type.upper()} prediction completed")
-        
         return results_df
+
     
     def create_visualizations(self, pk_results, pd_results):
         """Creating visualizations"""
@@ -420,27 +388,22 @@ class AutoVisualizer:
         print(" Auto visualization started!")
         
         try:
-            # 1. Load experiment data
             self.load_experiment_data()
             
-            # 2. 모델 로드
             self.load_model()
             
-            # 3. Test 데이터 준비
-            pk_test_data, pd_test_data, pk_features, pd_features = self.prepare_test_data()
+            pk_test_data, pd_test_data, pk_feats, pd_feats = self.prepare_test_data()
             
-            # 4. 예측 수행
             pk_results = self.make_predictions(
-                pk_test_data, pk_features, 
+                pk_test_data, pk_feats, 
                 self.scalers['pk_target_scaler'], 'pk'
             )
             
             pd_results = self.make_predictions(
-                pd_test_data, pd_features, 
+                pd_test_data, pd_feats, 
                 self.scalers['pd_target_scaler'], 'pd'
             )
             
-            # 5. 시각화 생성
             self.create_visualizations(pk_results, pd_results)
             
             print(" Auto visualization completed!")

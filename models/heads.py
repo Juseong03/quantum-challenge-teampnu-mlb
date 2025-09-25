@@ -41,7 +41,9 @@ def _reg_metrics(
         rmse = torch.sqrt(mse)
         
         # R2 calculation
-        y_mean = torch.mean(y.view(-1))
+        # y_mean = torch.mean(y.view(-1))
+        y_mean = torch.mean(y.float())
+
         ss_res = torch.sum((y.view(-1) - pred.view(-1)) ** 2)
         ss_tot = torch.sum((y.view(-1) - y_mean) ** 2)
         r2 = 1.0 - (ss_res / (ss_tot + 1e-12))
@@ -71,7 +73,6 @@ def _reg_metrics(
 # =========================
 # Base Head
 # =========================
-
 class BaseHead(nn.Module):
     def forward(self, z: torch.Tensor, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         raise NotImplementedError
@@ -82,21 +83,51 @@ class BaseHead(nn.Module):
         raise NotImplementedError
 
 # =========================
+# Binary Classification Head
+# =========================
+class BinaryClassificationHead(BaseHead):
+    def __init__(self, in_dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.mean = nn.Sequential(
+            nn.Linear(in_dim, in_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(in_dim // 2, 2)
+        )
+
+    def forward(self, z: torch.Tensor) -> Dict[str, torch.Tensor]:
+        logits = self.mean(z)
+        return {"pred": logits}
+    
+    def loss(self, outputs, batch):
+        y = batch["y"].long().view(-1)    # [B]
+        logits = outputs["pred"]          # [B, 2]
+        loss = F.cross_entropy(logits, y)
+        return loss, {"loss": loss.item()}
+
+    def metrics(self, outputs, batch):
+        y = batch["y"].long().view(-1)    # [B]
+        logits = outputs["pred"]          # [B, 2]
+        acc = (logits.argmax(dim=-1) == y).float().mean().item()
+        return {"accuracy": acc}
+
+
+
+# =========================
 # MSE Head
 # =========================
 
 class MSEHead(BaseHead):
     def __init__(self, in_dim: int, dropout: float = 0.0):
         super().__init__()
-        if dropout > 0:
-            self.mean = nn.Sequential(
-                nn.Dropout(dropout),
-                nn.Linear(in_dim, 1)
-            )
-        else:
-            self.mean = nn.Linear(in_dim, 1)
+        self.mean = nn.Sequential(
+            nn.Linear(in_dim, in_dim // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(in_dim // 2, 1)
+        )
 
-    def forward(self, z: torch.Tensor, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+    def forward(self, z: torch.Tensor) -> Dict[str, torch.Tensor]:
         mu = self.mean(z).squeeze(-1)
         return {"pred": mu}
 
@@ -271,3 +302,42 @@ class EmaxHead(BaseHead):
         return loss, metrics
 
 
+class EmaxGaussianHead(BaseHead):
+    def __init__(self, in_dim, min_logvar=-10, max_logvar=4):
+        super().__init__()
+        # Emax parameters head
+        self.param_head = nn.Sequential(
+            nn.Linear(in_dim, max(64, in_dim // 2)), nn.ReLU(),
+            nn.Linear(max(64, in_dim // 2), 4)  # E0, Emax, logEC50, n
+        )
+        # variance head
+        self.logvar_head = nn.Linear(in_dim, 1)
+        self.min_logvar = min_logvar
+        self.max_logvar = max_logvar
+        self.criterion = torch.nn.GaussianNLLLoss(full=True, reduction="mean")
+
+    def forward(self, z, batch):
+        p = self.param_head(z)
+        E0, Emax, logEC50, n_norm = p[...,0], F.softplus(p[...,1]), p[...,2], torch.sigmoid(p[...,3])
+        n = 0.5 + (6.0 - 0.5) * n_norm
+        EC50 = torch.exp(logEC50)
+        C = batch["C"].float().clamp_min(1e-8)
+        pred = E0 + Emax * (C**n) / (EC50**n + C**n)
+
+        logvar = self.logvar_head(z).squeeze(-1).clamp(self.min_logvar, self.max_logvar)
+        var = torch.exp(logvar)
+
+        return {"pred": pred, "var": var, "E0": E0, "Emax": Emax, "EC50": EC50, "n": n}
+
+    def loss(self, outputs, batch):
+        y = batch["y"].float().view(-1)
+        mu = outputs["pred"].view(-1)
+        var = outputs["var"].view(-1).clamp_min(1e-8)
+        loss = self.criterion(mu, y, var)  # Gaussian NLL 기반
+        with torch.no_grad():
+            metrics = {
+                "nll": float(loss.item()),
+                "mse": F.mse_loss(mu, y).item(),
+                "avg_sigma": torch.sqrt(var).mean().item(),
+            }
+        return loss, metrics

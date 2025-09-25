@@ -26,12 +26,35 @@ def load_estdata(path: str = "EstData.csv", *, standardize_cols: bool = True) ->
     df_dose = df[df['EVID'] == 1].copy()
     return df, df_obs, df_dose
 
+
+# =========================================================
+# PK/PD dataframe separation
+# =========================================================
+def separate_pkpd(df_obs: pd.DataFrame, df_dose: pd.DataFrame, use_fe: bool, use_perkg: bool):
+    """Return (df_final, pk_df, pd_df, pd_features, pk_features)."""
+    if use_fe:
+        df_final, pk_feats, pd_feats = use_feature_engineering(df_obs, df_dose, use_perkg)
+    else:
+        print("not applying feature engineering.")
+        df_final = df_obs.copy()
+        pk_feats = ['BW', 'COMED', 'DOSE', 'TIME']
+        pd_feats = ['BW', 'COMED', 'DOSE', 'TIME']
+
+    print(df_final.head(3))
+    pk_df = df_final[df_final['DVID'] == 1].copy()
+    pd_df = df_final[df_final['DVID'] == 2].copy()
+    pd_df = pd_df.copy()
+
+    return df_final, pk_df, pd_df, pd_feats, pk_feats
+
 # =========================================================
 # Time window analysis and selection
 # =========================================================
-def analyze_dose_patterns(dose_df: pd.DataFrame) -> dict:
+def analyze_dose_patterns(dose_df: pd.DataFrame, verbose: bool = False) -> dict:
     """Analyze dose patterns to determine optimal time windows"""
     if dose_df.empty:
+        if verbose:
+            print("No dose data found, using default windows: [24, 48, 72, 96, 120, 144, 168]")
         return {"avg_interval": 24, "max_interval": 48, "dose_frequency": "daily"}
     
     # Calculate dose intervals per subject
@@ -42,6 +65,8 @@ def analyze_dose_patterns(dose_df: pd.DataFrame) -> dict:
         dose_intervals.extend(intervals.tolist())
     
     if not dose_intervals:
+        if verbose:
+            print("No dose intervals found, using default windows: [24, 48, 72, 96, 120, 144, 168]")
         return {"avg_interval": 24, "max_interval": 48, "dose_frequency": "daily"}
     
     avg_interval = np.mean(dose_intervals)
@@ -66,7 +91,7 @@ def analyze_dose_patterns(dose_df: pd.DataFrame) -> dict:
         "dose_intervals": dose_intervals
     }
 
-def get_optimal_time_windows(dose_df: pd.DataFrame, custom_windows: list = None) -> list:
+def get_optimal_time_windows(dose_df: pd.DataFrame, custom_windows: list = None, verbose: bool = False) -> list:
     """Get optimal time windows based on data analysis or custom settings"""
     
     if custom_windows is not None:
@@ -77,7 +102,8 @@ def get_optimal_time_windows(dose_df: pd.DataFrame, custom_windows: list = None)
     
     # If no dose data, return default
     if dose_df.empty:
-        print(f"No dose data found, using default windows: {default_windows}")
+        if verbose:
+            print(f"No dose data found, using default windows: {default_windows}")
         return default_windows
     
     # Analyze dose patterns
@@ -86,7 +112,8 @@ def get_optimal_time_windows(dose_df: pd.DataFrame, custom_windows: list = None)
     max_interval = pattern_info["max_interval"]
     frequency = pattern_info["dose_frequency"]
     
-    print(f"Dose pattern analysis: avg_interval={avg_interval:.2f}h, frequency={frequency}")
+    if verbose:
+        print(f"Dose pattern analysis: avg_interval={avg_interval:.2f}h, frequency={frequency}")
     
     # Select windows based on analysis
     if frequency == "frequent":  # 8 hours apart
@@ -130,7 +157,8 @@ def features_from_dose_history(
     allow_future_dose: bool = False,
     time_windows: list = None,
     add_decay_features: bool = True,
-    half_lives: list = [24, 48, 72]   # hours
+    half_lives: list = [24, 48, 72],   # hours
+    verbose: bool = False
 ) -> pd.DataFrame:
     required_obs = {"ID", "TIME", "DV", "DVID"}
     required_dose = {"ID", "TIME", "AMT"}
@@ -153,8 +181,9 @@ def features_from_dose_history(
     }
 
     # Get optimal time windows
-    optimal_windows = get_optimal_time_windows(dose_df, time_windows)
-    print(f"Using time windows: {optimal_windows} hours")
+    optimal_windows = get_optimal_time_windows(dose_df, time_windows, verbose)
+    if verbose:
+        print(f"Using time windows: {optimal_windows} hours")
     
     tsld_list, last_amt_list = [], []
     ndose_list, cumdose_list = [], []
@@ -250,7 +279,8 @@ def features_from_dose_history(
     out["LAST_DOSE_TIME"] = out["TIME"] - out["TSLD"]
 
     # TIME transformations
-    print("  + TIME feature enhancement applied (essential transformations)")
+    if verbose:
+        print("  + TIME feature enhancement applied (essential transformations)")
     out["TIME_SQUARED"] = out["TIME"] ** 2
     out["TIME_LOG"] = np.log1p(out["TIME"])
 
@@ -264,7 +294,8 @@ def features_from_dose_history(
     if add_decay_features:
         for col, vals in decay_lists.items():
             out[col] = vals
-            print(f"  + decay feature added: {col}")
+            if verbose:
+                print(f"  + decay feature added: {col}")
 
     # Baselines
     base_by_id_dvid = (
@@ -275,11 +306,14 @@ def features_from_dose_history(
     if add_pd_delta:
         out["PD_BASELINE"] = np.where(out["DVID"].eq(2), base_by_id_dvid, np.nan)
         out["PD_DELTA"] = np.where(out["DVID"].eq(2), out["DV"] - out["PD_BASELINE"], np.nan)
-        print("WARNING: PD_DELTA target uses PD_BASELINE which may cause data leakage!")
+        if verbose:
+            print("WARNING: PD_DELTA target uses PD_BASELINE which may cause data leakage!")
 
     if add_pk_baseline:
         out["PK_BASELINE"] = np.where(out["DVID"].eq(1), base_by_id_dvid, np.nan)
         out["PK_DELTA"] = np.where(out["DVID"].eq(1), out["DV"] - out["PK_BASELINE"], np.nan)
+        if verbose:
+            print("WARNING: PK_DELTA target uses PK_BASELINE which may cause data leakage!")
 
     return out
 
@@ -384,6 +418,11 @@ def use_feature_engineering(
         'N_DOSES_UP_TO_T', 'CUM_DOSE_UP_TO_T',
         'TIME_SQUARED', 'TIME_LOG'
     ]
+    
+    # Add WEEKLY feature if it exists in the data
+    if 'WEEKLY' in df_final.columns:
+        base_feats.append('WEEKLY')
+        print("  + WEEKLY feature added for dosing pattern differentiation")
 
     # Add window features
     window_features = [col for col in df_final.columns if col.startswith('DOSE_SUM_PREV')]
@@ -426,31 +465,15 @@ def use_feature_engineering(
     df_final.fillna(0, inplace=True)
     return df_final, pk_features, pd_features
 
-# =========================================================
-# PK/PD dataframe separation
-# =========================================================
-def separate_pkpd(df_obs: pd.DataFrame, df_dose: pd.DataFrame, use_fe: bool, use_perkg: bool):
-    """Return (df_final, pk_df, pd_df, pd_features, pk_features)."""
-    if use_fe:
-        df_final, pk_feats, pd_feats = use_feature_engineering(df_obs, df_dose, use_perkg)
-    else:
-        print("not applying feature engineering.")
-        df_final = df_obs.copy()
-        pk_feats = ['BW', 'COMED', 'DOSE', 'TIME']
-        pd_feats = ['BW', 'COMED', 'DOSE', 'TIME']
-
-    print(df_final.head(3))
-    pk_df = df_final[df_final['DVID'] == 1].copy()
-    pd_df = df_final[df_final['DVID'] == 2].copy()
-    return df_final, pk_df, pd_df, pd_feats, pk_feats
 
 # =========================================================
 # Custom Dataset
 # =========================================================
 class CustomDataset(Dataset):
-    def __init__(self, X, y, ids=None, times=None, mask=None):
+    def __init__(self, X, y, y_clf=None, ids=None, times=None, mask=None):
         self.X = torch.tensor(X, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.float32)
+        self.y_clf = torch.tensor(y_clf, dtype=torch.float32)
         self.ids = None if ids is None else torch.tensor(ids, dtype=torch.long)
         self.times = None if times is None else torch.tensor(times, dtype=torch.float32)
         self.mask = None if mask is None else torch.tensor(mask, dtype=torch.float32)
@@ -463,3 +486,61 @@ class CustomDataset(Dataset):
         if self.ids is not None:   items.append(self.ids[idx])
         if self.times is not None: items.append(self.times[idx])
         return tuple(items)
+
+# =========================================================
+# Daily → Weekly dataset 변환
+# =========================================================
+def convert_to_weekly_dataset(df_all: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert daily dosing dataset into weekly dosing dataset.
+    Rule: 7일치 누적 dose를 1일차(week start)에 몰아서 주고, 나머지 6일은 AMT=0.
+
+    Args:
+        df_all: 원본 EstData DataFrame (daily dosing)
+
+    Returns:
+        df_weekly: Weekly dosing 변환된 DataFrame
+    """
+    df = df_all.copy()
+    df_weekly = []
+
+    for sid, g in df.groupby("ID"):
+        g = g.sort_values("TIME").reset_index(drop=True)
+
+        # dose/obs 분리
+        g_dose = g[g["EVID"] == 1].copy()
+        g_obs = g[g["EVID"] == 0].copy()
+
+        # week index 계산
+        g_dose["WEEK"] = (g_dose["TIME"] // 168).astype(int)
+
+        weekly_doses = []
+        for w, grp in g_dose.groupby("WEEK"):
+            week_start = w * 168
+            total_amt = grp["AMT"].sum()
+
+            # 첫날(week_start)에만 누적 dose 기록
+            first_row = grp.iloc[0].copy()
+            first_row["TIME"] = week_start
+            first_row["AMT"] = total_amt
+            weekly_doses.append(first_row)
+
+            # 나머지 6일은 AMT=0으로 기록
+            for offset in [24, 48, 72, 96, 120, 144]:
+                zero_row = grp.iloc[0].copy()
+                zero_row["TIME"] = week_start + offset
+                zero_row["AMT"] = 0.0
+                weekly_doses.append(zero_row)
+
+        g_dose_weekly = pd.DataFrame(weekly_doses)
+
+        # obs는 그대로 유지
+        g_weekly = pd.concat([g_dose_weekly, g_obs], ignore_index=True)
+        g_weekly = g_weekly.sort_values("TIME").reset_index(drop=True)
+
+        # Weekly 플래그 추가
+        g_weekly["WEEKLY"] = 1
+        df_weekly.append(g_weekly)
+
+    df_weekly = pd.concat(df_weekly, ignore_index=True)
+    return df_weekly

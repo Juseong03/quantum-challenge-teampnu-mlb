@@ -99,6 +99,7 @@ class MLPEncoder(BaseEncoder):
         self.out_dim = d
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        
         if x.dim() == 3:
             x = self.pooling(x) # [B, N, F] -> [B, F]
         return self.net(x) # [B, F] -> [B, H]
@@ -258,7 +259,6 @@ class MoEEncoder(BaseEncoder):
 # =========================
 # Advanced ResMLP + MoE Components
 # =========================
-
 class ResidualMLPBlock(nn.Module):
     """Advanced Residual MLP Block with LayerNorm and Dropout"""
     def __init__(
@@ -603,7 +603,7 @@ class ResMLPMoEEncoder(BaseEncoder):
         # Output projection
         x = self.output_proj(x)
         
-        return x, total_aux_loss
+        return x#, total_aux_loss
 
 class CNNEncoder(BaseEncoder):
     """CNN-based encoder for sequence data"""
@@ -1254,5 +1254,5 @@ class ResQNNMoEEncoder(BaseEncoder):
         # Output projection
         x = self.output_proj(x)
         
-        return x, total_aux_loss
+        return x#, total_aux_loss
     

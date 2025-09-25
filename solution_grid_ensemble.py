@@ -14,52 +14,69 @@ from utils.helpers import get_device
 from config import Config
 
 # ==========================================================
-# Load model & scalers
+# Ensemble loader
 # ==========================================================
-model_path = Path("results/full1/dual_stage/mlp/s1")
-config_path = model_path / "config.json"
-scaler_path = model_path / "scalers.pkl"
+def load_model_bundle(model_dir: Path):
+    """하나의 학습 결과 디렉토리에서 모델+스케일러+피처 불러오기"""
+    with open(model_dir / "config.json", "r") as f:
+        config_dict = json.load(f)
+    config = Config()
+    for k, v in config_dict.items():
+        if hasattr(config, k):
+            setattr(config, k, v)
 
-print("🚀 MODEL-BASED PK/PD CHALLENGE SOLUTION")
-print("="*60)
+    # scalers
+    with open(model_dir / "scalers.pkl", "rb") as f:
+        pk_scaler = pickle.load(f)
+        pd_scaler = pickle.load(f)
+        pk_target_scaler = pickle.load(f)
+        pd_target_scaler = pickle.load(f)
 
-with open(config_path, "r") as f:
-    config_dict = json.load(f)
+    # features
+    with open(model_dir / "features.pkl", "rb") as f:
+        feats = pickle.load(f)
+    pk_features = feats["pk"]
+    pd_features = feats["pd"]
 
-config = Config()
-for k, v in config_dict.items():
-    if hasattr(config, k):
-        setattr(config, k, v)
+    # model
+    model = create_model(config, None, pk_features, pd_features)
+    checkpoint = torch.load(model_dir / "model.pth", map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.to(device).eval()
 
-with open(scaler_path, "rb") as f:
-    pk_scaler = pickle.load(f)
-    pd_scaler = pickle.load(f)
-    pk_target_scaler = pickle.load(f)
-    pd_target_scaler = pickle.load(f)
+    return {
+        "model": model,
+        "pk_scaler": pk_scaler,
+        "pd_scaler": pd_scaler,
+        "pk_target_scaler": pk_target_scaler,
+        "pd_target_scaler": pd_target_scaler,
+        "pk_features": pk_features,
+        "pd_features": pd_features,
+    }
 
-device = get_device()
-pk_features = [f"feat_{i}" for i in range(pk_scaler.n_features_in_)]
-pd_features = [f"feat_{i}" for i in range(pd_scaler.n_features_in_)]
-
-model = create_model(config, None, pk_features, pd_features)
-checkpoint = torch.load(model_path / "model.pth", map_location=device)
-model.load_state_dict(checkpoint["model_state_dict"])
-model.to(device).eval()
-
-print(f"✅ Model loaded: {config.mode} mode, {config.encoder} encoder")
-print(f"📊 Input features: {len(pk_features)}")
 
 from data.loaders import features_from_dose_history, use_feature_engineering  # <-- FE 코드 import  
 
 # ==========================================================
-# Feature builder using new FE pipeline
+# Ensemble setup
 # ==========================================================
-def create_test_batch(dose_schedule, time, bw=75, comed=0, batch_size=1):
-    """
-    Build features consistent with training FE.
-    dose_schedule: list of (t, amt)
-    time: evaluation time
-    """
+device = get_device()
+model_paths = [
+    Path("results/baseline/dual_stage/mlp/s1"),
+    Path("results/baseline/dual_stage/mlp/s2"),
+    Path("results/baseline/dual_stage/mlp/s3"),
+    Path("results/baseline2/dual_stage/mlp/s1"),
+    Path("results/baseline2/dual_stage/mlp/s2"),
+    Path("results/baseline2/dual_stage/mlp/s3"),
+]
+bundles = [load_model_bundle(p) for p in model_paths]
+print(f"✅ Loaded {len(bundles)} models for ensemble")
+
+# ==========================================================
+# Ensemble prediction
+# ==========================================================
+def create_test_batch(dose_schedule, time, bw, comed, bundle, batch_size=1):
+    """특정 모델 bundle에 맞는 feature vector 생성"""
     obs = pd.DataFrame([{
         "ID": 1, "TIME": time, "DV": 0.0, "DVID": 2,
         "BW": bw, "COMED": comed,
@@ -69,18 +86,14 @@ def create_test_batch(dose_schedule, time, bw=75, comed=0, batch_size=1):
 
     fe_out = features_from_dose_history(
         obs, dose,
-        add_pk_baseline=False,
-        add_pd_delta=False,
-        target="dv",
-        allow_future_dose=False,
-        time_windows=None,
-        add_decay_features=True,
-        half_lives=[24,48,72]
+        add_pk_baseline=False, add_pd_delta=False,
+        target="dv", allow_future_dose=False,
+        time_windows=None, add_decay_features=True,
+        half_lives=[24, 48, 72]
     )
 
-    # ✅ 반드시 학습 당시의 feature 리스트와 동일하게 선택
-    X = fe_out[pk_features].values  
-    X_scaled = pk_scaler.transform(X)
+    X = fe_out[bundle["pk_features"]].values
+    X_scaled = bundle["pk_scaler"].transform(X)
     X_tensor = torch.FloatTensor(X_scaled).to(device)
 
     return {
@@ -88,6 +101,18 @@ def create_test_batch(dose_schedule, time, bw=75, comed=0, batch_size=1):
         "pd": {"x": X_tensor, "y": torch.zeros(batch_size, 1).to(device)},
     }
 
+def ensemble_predict(dose_schedule, time, bw, comed):
+    """여러 모델의 PD 예측 평균"""
+    preds = []
+    for bundle in bundles:
+        batch = create_test_batch(dose_schedule, time, bw, comed, bundle)
+        with torch.no_grad():
+            pred = bundle["model"](batch)["pd"]["pred"]
+            biom = bundle["pd_target_scaler"].inverse_transform(
+                pred.cpu().numpy().reshape(-1, 1)
+            )[0, 0]
+        preds.append(biom)
+    return np.mean(preds)
 
 
 # ==========================================================
@@ -99,44 +124,42 @@ print(f"👥 Population size: {len(subjects)}")
 
 baseline_threshold = 3.3
 
+# ==========================================================
+# Simulation with ensemble
+# ==========================================================
 def simulate_population(dose, schedule="daily", horizon=24, bw_shift=None, comed_allowed=True):
-    """Simulate biomarker suppression across population."""
     suppress_flags = []
     for _, row in subjects.iterrows():
         bw, comed = row["BW"], row["COMED"]
         if not comed_allowed and comed == 1:
             continue
         if bw_shift == "wider":
-            # scale BW from 50–100 → 70–140
             bw = np.interp(bw, [50, 100], [70, 140])
-        # Build dosing schedule
+
         if schedule == "daily":
-            dose_schedule = [(24*i, dose) for i in range(21)]  # 3 weeks daily
+            dose_schedule = [(24*i, dose) for i in range(21)]
             start_time = 21*24
         elif schedule == "weekly":
-            dose_schedule = [(168*i, dose) for i in range(4)]  # 4 weeks weekly
+            dose_schedule = [(168*i, dose) for i in range(4)]
             start_time = 4*168
         else:
             raise ValueError("Unknown schedule")
 
-        # Simulate steady-state horizon
         biomarker_vals = []
         for t in range(horizon+1):
-            batch = create_test_batch(dose_schedule, time=start_time+t, bw=bw, comed=comed)
-            with torch.no_grad():
-                pred = model(batch)["pd"]["pred"]
-                biom = pd_target_scaler.inverse_transform(pred.cpu().numpy().reshape(-1,1))[0,0]
+            biom = ensemble_predict(dose_schedule, start_time+t, bw, comed)
             biomarker_vals.append(biom)
+
         min_val = min(biomarker_vals)
         suppress_flags.append(min_val < baseline_threshold)
-    return np.mean(suppress_flags)  # fraction suppressed
+    return np.mean(suppress_flags)
 
 # ==========================================================
 # Task 1 & 2: optimal doses
 # ==========================================================
 print("\n🎯 TASK 1: Daily dosing (0.5mg step)")
 best_dose, best_frac = None, 0
-for dose in np.arange(0.5, 25.5, 0.5):
+for dose in np.arange(1, 15, 0.5):
     frac = simulate_population(dose, schedule="daily", horizon=24)
     if frac >= 0.9:
         best_dose, best_frac = dose, frac
@@ -145,7 +168,7 @@ print(f"  ✅ Optimal daily dose: {best_dose} mg (Suppression {best_frac:.1%})")
 
 print("\n🎯 TASK 2: Weekly dosing (5mg step)")
 best_dose, best_frac = None, 0
-for dose in np.arange(5, 55, 5):
+for dose in np.arange(10, 55, 5):
     frac = simulate_population(dose, schedule="weekly", horizon=168)
     if frac >= 0.9:
         best_dose, best_frac = dose, frac

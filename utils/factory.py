@@ -2,40 +2,27 @@
 Factory functions for building models and components
 Separates model creation logic to avoid circular imports
 """
-def create_model(config, loaders, pk_features, pd_features):
+def create_model(config, loaders, pk_feats, pd_feats):
     """Create model based on configuration"""
-    import importlib
-    from utils.helpers import get_device
-
-    # Lazy import to avoid circular dependency
-    unified_model_module = importlib.import_module('models.unified_model')
-    UnifiedPKPDModel = unified_model_module.UnifiedPKPDModel
-
-    pk_input_dim = len(pk_features)
-    pd_input_dim = len(pd_features)
-    device = get_device(config.device_id)
-
+    from models.unified_model import UnifiedPKPDModel
     model = UnifiedPKPDModel(
         config=config,
-        pk_features=pk_features,
-        pd_features=pd_features,
-        pk_input_dim=pk_input_dim,
-        pd_input_dim=pd_input_dim
+        pk_features=pk_feats,
+        pd_features=pd_feats,   
+        pk_input_dim=len(pk_feats),
+        pd_input_dim=len(pd_feats)
     )
-
     return model
 
 def create_trainer(config, model, loaders, device):
     """Create trainer based on configuration"""
     from training.unified_trainer import UnifiedPKPDTrainer
-
     trainer = UnifiedPKPDTrainer(
         model=model,
         config=config,
         data_loaders=loaders,
         device=device
     )
-
     return trainer
 
 def build_encoder(encoder_type, input_dim, config):
@@ -164,6 +151,16 @@ def build_head(head_type, hidden_dim, config=None):
         from models.heads import MSEHead
         dropout_rate = config.mc_dropout_rate if config and config.use_mc_dropout else 0.0
         return MSEHead(hidden_dim, dropout_rate)
+    elif head_type == "emax_gaussian":
+        from models.heads import EmaxGaussianHead
+        return EmaxGaussianHead(hidden_dim)
+    elif head_type == "emax":
+        from models.heads import EmaxHead
+        return EmaxHead(hidden_dim)
+
+    elif head_type == "binary_classification":
+        from models.heads import BinaryClassificationHead
+        return BinaryClassificationHead(hidden_dim)
     else:
         from models.heads import MSEHead
         dropout_rate = config.mc_dropout_rate if config and config.use_mc_dropout else 0.0

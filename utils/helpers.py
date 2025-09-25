@@ -6,7 +6,7 @@ import torch
 import numpy as np
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime
-
+import pandas as pd
 # Additional utility functions
 import os
 from pathlib import Path
@@ -21,159 +21,94 @@ from models.encoders import MLPEncoder, ResMLPEncoder, MoEEncoder, ResMLPMoEEnco
 from models.encoders import QResMLPMoEEncoder, QMoEEncoder, QResMLPEncoder, QMLPEncoder, CNNEncoder
 
 def generate_run_name(config) -> str:
-    """
-    Generate a descriptive run name based on configuration
-    
-    Args:
-        config: Configuration object with training parameters
-        
-    Returns:
-        str: Generated run name in format: mode_encoder_s{seed}_{timestamp}_{features}
-    """
     # Create human-readable timestamp (YYMMDD_HHMM)
     timestamp = datetime.now().strftime("%y%m%d_%H%M")
     
-    # Determine encoder name for run name
     if config.encoder_pk or config.encoder_pd:
-        # Different encoders for PK and PD
         pk_encoder = config.encoder_pk or config.encoder
         pd_encoder = config.encoder_pd or config.encoder
         encoder_name = f"{pk_encoder}-{pd_encoder}"
     else:
-        # Same encoder for both
         encoder_name = config.encoder
     
-    # Create postfix based on configuration (only add if features are enabled)
     postfix_parts = []
-    
-    # Feature engineering
-    if getattr(config, 'use_feature_engineering', False):
+    if getattr(config, 'use_fe', False):
         postfix_parts.append("fe")
-    
-    # Mixup augmentation
-    if getattr(config, 'use_mixup', False):
-        postfix_parts.append("mixup")
-    
-    # Contrastive learning
     if getattr(config, 'use_contrast', False):
         postfix_parts.append("contrast")
-    
-    # Uncertainty quantification
-    if getattr(config, 'use_uncertainty', False):
-        postfix_parts.append("uncertainty")
-    
-    # Active learning
-    if getattr(config, 'use_active_learning', False):
-        postfix_parts.append("active")
-    
-    # Meta learning
-    if getattr(config, 'use_meta_learning', False):
-        postfix_parts.append("meta")
-    
-    # Only add postfix if there are enabled features
+    if getattr(config, 'threshold', None):
+        postfix_parts.append(f"clf_threshold")
     postfix = "_".join(postfix_parts) if postfix_parts else ""
-    
-    # Create clean run name
-    if postfix:
-        run_name = f"{config.mode}_{encoder_name}_s{config.random_state}_{timestamp}_{postfix}"
-    else:
-        run_name = f"{config.mode}_{encoder_name}_s{config.random_state}_{timestamp}"
-    
+    run_name = f"{config.mode}_{encoder_name}_s{config.random_state}_{timestamp}_{postfix}"
     return run_name
 
-
-
-
-def scaling_and_prepare_loader(data, features, batch_size, target_col):
-    """Prepare data loader"""
-
-    
-    # Extract features and target
+def scaling_and_prepare_loader(
+    data,
+    features,
+    batch_size,
+    target_col,
+    *,
+    use_scaling=True,
+    is_clf=False,
+    threshold=3.3
+):    # Extract features and target
     if isinstance(data, dict):
-        # Handle train/val/test splits
-        train_data = data['train']
-        val_data = data['val'] 
-        test_data = data['test']
+        train_data = data.get("train", pd.DataFrame())
+        val_data   = data.get("val", pd.DataFrame())
+        test_data  = data.get("test", pd.DataFrame())
     else:
-        # Single dataset - split it
         train_data = data
-        val_data = data
-        test_data = data
-    
-    # Prepare training data
+        val_data   = pd.DataFrame(columns=train_data.columns)
+        test_data  = pd.DataFrame(columns=train_data.columns)
+
+
     X_train = train_data[features].values.astype(np.float32)
-    y_train = train_data[target_col].values.astype(np.float32).reshape(-1, 1)
-    
-    # Fit scaler on training data (optional scaling)
+    y_train = train_data[target_col].values.reshape(-1, 1)
+    y_train_clf = (y_train >= threshold).astype(np.int64).reshape(-1)
+     
+    scaler_y = StandardScaler() if use_scaling else None
     scaler_X = StandardScaler()
-    scaler_y = StandardScaler()
+
+    X_train = scaler_X.fit_transform(X_train)
+    if scaler_y is not None:
+        y_train = scaler_y.fit_transform(y_train)
     
-    # Option to disable scaling for testing
-    use_scaling = True  # Set to False to disable scaling
-    
-    if use_scaling:
-        X_train_scaled = scaler_X.fit_transform(X_train)
-        y_train_scaled = scaler_y.fit_transform(y_train)
-    else:
-        X_train_scaled = X_train
-        y_train_scaled = y_train
-    
-    # Create datasets
     train_dataset = TensorDataset(
-        torch.tensor(X_train_scaled), 
-        torch.tensor(y_train_scaled)
+        torch.tensor(X_train, dtype=torch.float32),
+        torch.tensor(y_train, dtype=torch.float32),
+        torch.tensor(y_train_clf, dtype=torch.long)
     )
+
+    # helper to process val/test
+    def _process_subset(df, is_clf=False, threshold=3.3):
+        if df.empty:
+            return TensorDataset(
+                torch.empty(0, len(features), dtype=torch.float32),
+                torch.empty(0, 1, dtype=torch.float32),   # y_reg
+                torch.empty(0, dtype=torch.long)          # y_clf
+            )
+        
+        X = df[features].values.astype(np.float32)
+        y = df[target_col].values.reshape(-1, 1)
+        y_clf = (y >= threshold).astype(np.int64).reshape(-1)
+
+        X = scaler_X.transform(X)
+        if not is_clf and scaler_y is not None:
+            y = scaler_y.transform(y)
+        
+        return TensorDataset(
+            torch.tensor(X, dtype=torch.float32),
+            torch.tensor(y, dtype=torch.long if is_clf else torch.float32),
+            torch.tensor(y_clf, dtype=torch.long if is_clf else None)
+        )
+    # TensorDataset
+    val_dataset  = _process_subset(val_data, is_clf, threshold)
+    test_dataset = _process_subset(test_data, is_clf, threshold)
     
-    # Prepare validation data
-    X_val = val_data[features].values.astype(np.float32)
-    y_val = val_data[target_col].values.astype(np.float32).reshape(-1, 1)
-    
-    if use_scaling:
-        X_val_scaled = scaler_X.transform(X_val)
-        y_val_scaled = scaler_y.transform(y_val)
-    else:
-        X_val_scaled = X_val
-        y_val_scaled = y_val
-    
-    val_dataset = TensorDataset(
-        torch.tensor(X_val_scaled),
-        torch.tensor(y_val_scaled)
-    )
-    
-    # Prepare test data
-    X_test = test_data[features].values.astype(np.float32)
-    y_test = test_data[target_col].values.astype(np.float32).reshape(-1, 1)
-    
-    if use_scaling:
-        X_test_scaled = scaler_X.transform(X_test)
-        y_test_scaled = scaler_y.transform(y_test)
-    else:
-        X_test_scaled = X_test
-        y_test_scaled = y_test
-    
-    test_dataset = TensorDataset(
-        torch.tensor(X_test_scaled),
-        torch.tensor(y_test_scaled)
-    )
-    
-    # Create data loaders
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True, 
-    )
-    
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=batch_size, 
-        shuffle=False, 
-    )
-    
-    test_loader = DataLoader(
-        test_dataset, 
-        batch_size=batch_size, 
-        shuffle=False, 
-    )
+    # DataLoaders
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, )
+    val_loader   = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
     return scaler_X, scaler_y, train_loader, val_loader, test_loader
 

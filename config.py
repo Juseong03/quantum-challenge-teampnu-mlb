@@ -26,7 +26,7 @@ class Config:
     encoder_pk: Optional[str] = None  # PK-specific encoder
     encoder_pd: Optional[str] = None  # PD-specific encoder
     head_pk: str = "mse"  # "mse", "gauss", "poisson"
-    head_pd: str = "mse"  # "mse", "gauss", "poisson", "emax"
+    head_pd: str = "mse"  # "mse", "gauss", "poisson", "emax" emax_gaussian
     
     # === Model hyperparameters ===
     hidden: int = 128  # Increased for TIME feature enhancement model capacity
@@ -51,12 +51,12 @@ class Config:
     
     # === Uncertainty Quantification ===
     use_mc_dropout: bool = False  # Disabled by default for faster training
-    mc_dropout_rate: float = 0.2  # Matches main dropout rate
-    mc_samples: int = 100  # Increased for better uncertainty estimation
+    mc_dropout_rate: float = 0.15  # Matches main dropout rate
+    mc_samples: int = 50  # Increased for better uncertainty estimation
     
     # === Data preprocessing ===
-    use_feature_engineering: bool = True  # Enabled by default for better performance
-    perkg: bool = False
+    use_fe: bool = True  # Enabled by default for better performance
+    use_perkg: bool = False
     allow_future_dose: bool = False
     time_windows: List[int] = None
     
@@ -82,12 +82,9 @@ class Config:
 
     # Supervised training augmentation
     use_aug_supervised: bool = False  # Use augmentation during supervised training
-    aug_lambda: float = 0.3  # Weight for augmented loss (original + lambda * augmented)
+    aug_lambda: float = 0.15  # Weight for augmented loss (original + lambda * augmented)
 
-    # Legacy mixup settings (for backward compatibility)
-    use_mixup: bool = False  # Legacy: use aug_method instead
-    mixup_prob: float = 0.1  # Legacy: use aug_method instead
-    
+
     # === SimCLR Contrastive learning ===
     temperature: float = 0.1  # Temperature for SimCLR contrastive learning
     time_jitter_std: float = 0.1  # Time jitter standard deviation
@@ -95,7 +92,18 @@ class Config:
     contrastive_scale_range: tuple = (0.8, 1.2)  # Scaling range for contrastive augmentation
     pretraining_epochs: int = 50  # Number of pretraining epochs
     pretraining_patience: int = 20  # Patience for contrastive pretraining
-    use_contrastive_pretraining: bool = False  # Enable contrastive pretraining (set by --use_contrastive_pretraining flag)
+    use_pt_contrast: bool = False  # Enable contrastive pretraining (set by --use_pt_contrast flag)
+    use_pt_clf: bool = False  # Enable PD pretraining with classification task (set by --use_pt_clf flag)
+    
+
+
+    use_clf: bool = False  # Enable PD to classification task (set by --use_clf flag)
+    threshold: float = 3.3  # Threshold for classification task
+    clf_finetune: bool = False  # Enable PD to classification task (set by --clf_finetune flag)
+    clf_lr: float = 1e-3  # Learning rate for classification head
+    clf_patience: int = 100  # Patience for classification head
+    clf_epochs: int = 1000  # Number of epochs for classification head
+
 
     # === Data splitting ===
     split_strategy: str = "stratify_dose_even"  # Best strategy for PK/PD data
@@ -127,6 +135,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
                        choices=["separate", "joint", "shared", "dual_stage", "integrated", "two_stage_shared"], 
                        default="separate", help="Training mode")
     parser.add_argument("--csv", default="data/EstData.csv", help="Data CSV file path")
+    # EstData_combined or EstData_weekly
     
     # === Training settings ===
     parser.add_argument("--epochs", type=int, default=1000, help="Number of training epochs")
@@ -137,8 +146,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
     # === Model settings ===
     parser.add_argument("--encoder", 
                        choices=["mlp", "resmlp", "moe", "resmlp_moe", "cnn", "qmlp", "qresmlp", "qmoe", "qresmlp_moe",
-                                "qnn", "resqnn_moe",
-                                ],  
+                                "qnn", "resqnn_moe",],  
                        default="mlp", help="Default encoder type")
     parser.add_argument("--encoder_pk", 
                        choices=["mlp", "resmlp", "moe", "resmlp_moe", "cnn", "qmlp", "qresmlp", "qmoe", "qresmlp_moe"], 
@@ -149,7 +157,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--head_pk", choices=["mse", "gauss", "poisson"], 
                        default="mse", help="PK head type")
-    parser.add_argument("--head_pd", choices=["mse", "gauss", "poisson", "emax"], 
+    parser.add_argument("--head_pd", choices=["mse", "gauss", "poisson", "emax", "emax_gaussian"], 
                        default="mse", help="PD head type")
     
     # === Model hyperparameters ===
@@ -176,7 +184,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
     
     # === Data preprocessing ===
     parser.add_argument("--use_fe", action="store_true", help="Feature engineering")
-    parser.add_argument("--perkg", action="store_true", help="Per kg dose")
+    parser.add_argument("--use_perkg", action="store_true", help="Per kg dose")
     parser.add_argument("--allow_future_dose", action="store_true", help="Allow future dose information")
     parser.add_argument("--time_windows", type=str, default=None,
                        help="Time windows (comma-separated, e.g., '24,48,72,96,120,144,168')")
@@ -218,6 +226,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
                        help="Probability for random erasing (default: 0.1)")
     parser.add_argument("--feature_dropout_prob", type=float, default=0.1,
                        help="Probability for feature dropout (default: 0.1)")
+                       
     parser.add_argument("--use_aug_supervised", action="store_true",
                        help="Use augmentation during supervised training")
     parser.add_argument("--aug_lambda", type=float, default=0.3,
@@ -229,12 +238,23 @@ def create_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--noise_std", type=float, default=0.05, help="Gaussian noise standard deviation")
     parser.add_argument("--dropout_rate", type=float, default=0.1, help="Dropout rate for augmentation")
     parser.add_argument("--contrastive_scale_range", nargs=2, type=float, default=[0.8, 1.2], help="Scaling range for contrastive augmentation")
-    parser.add_argument("--pretraining_epochs", type=int, default=50, help="Number of contrastive pretraining epochs")
-    parser.add_argument("--pretraining_patience", type=int, default=20, help="Patience for contrastive pretraining")
-    parser.add_argument("--use_contrastive_pretraining", action="store_true", help="Enable contrastive pretraining")
-    
+    parser.add_argument("--pretraining_epochs", type=int, default=1000, help="Number of contrastive pretraining epochs")
+    parser.add_argument("--pretraining_patience", type=int, default=100, help="Patience for contrastive pretraining")
+
+    parser.add_argument("--use_pt_contrast", action="store_true", help="Enable contrastive pretraining")
+    parser.add_argument("--use_pt_clf", action="store_true", help="Enable PD pretraining with classification task")
+
+    parser.add_argument("--use_clf", action="store_true", help="PD to classification task") 
+    parser.add_argument("--threshold", type=float, default=3.3, help="Threshold for classification task")
+    parser.add_argument("--clf_finetune", action="store_true", help="Finetune classification head")
+    parser.add_argument("--clf_lr", type=float, default=1e-3, help="Learning rate for classification head")
+    parser.add_argument("--clf_patience", type=int, default=100, help="Patience for classification head")
+    parser.add_argument("--clf_epochs", type=int, default=1000, help="Number of epochs for classification head")
+
     # === Data splitting ===
-    parser.add_argument("--split_strategy", default="stratify_dose_even_no_placebo_valtest", # "stratify_dose_even", "stratify_dose_even_no_placebo_test", "leave_one_dose_out", "random_subject", "only_bw_range" "highest_bw_one_test", "stratify_dose_even_no_placebo_valtest"
+    parser.add_argument("--split_strategy", 
+                       choices=["stratify_dose_even", "stratify_dose_even_no_placebo_test", "leave_one_dose_out", "random_subject", "only_bw_range", "highest_bw_one_test", "stratify_dose_even_no_placebo_valtest"],
+                       default="stratify_dose_even_no_placebo_valtest",
                        help="Data splitting strategy")
     parser.add_argument("--test_size", type=float, default=0.1, help="Test set size")
     parser.add_argument("--val_size", type=float, default=0.1, help="Validation set size")
@@ -315,8 +335,8 @@ def parse_args() -> Config:
         mc_samples=args.mc_samples,
         
         # Data preprocessing
-        use_feature_engineering=args.use_fe,
-        perkg=args.perkg,
+        use_fe=args.use_fe,
+        use_perkg=args.use_perkg,
         allow_future_dose=args.allow_future_dose,
         time_windows=parse_time_windows(args.time_windows) if args.time_windows else None,
         
@@ -344,17 +364,20 @@ def parse_args() -> Config:
         use_aug_supervised=args.use_aug_supervised,
         aug_lambda=args.aug_lambda,
 
-        # Legacy mixup settings
-        use_mixup=False,
-        mixup_prob=0.1,
-
         temperature=args.temperature,
         time_jitter_std=args.time_jitter_std,   
         noise_std=args.noise_std,
         pretraining_epochs=args.pretraining_epochs,
         pretraining_patience=args.pretraining_patience,
-        use_contrastive_pretraining=args.use_contrastive_pretraining,
-        
+        use_pt_contrast=args.use_pt_contrast,
+        use_pt_clf=args.use_pt_clf,
+        use_clf=args.use_clf,
+        threshold=args.threshold,
+        clf_finetune=args.clf_finetune,
+        clf_lr=args.clf_lr,
+        clf_patience=args.clf_patience,
+        clf_epochs=args.clf_epochs,
+
         # Data splitting
         split_strategy=args.split_strategy,
         test_size=args.test_size,

@@ -1,16 +1,15 @@
 """
 Contrastive pretraining methods for PK/PD training
 """
-
 import torch
+import torch.nn.functional as F
+import torch.nn as nn
+import torch.optim as optim
 from typing import Dict, Any, List
 from pathlib import Path
-from .pk_label_integration import PKLabelIntegrator, CrossModalContrastiveLearning
 
 
 class ContrastivePretraining:
-    """Handle contrastive pretraining logic"""
-    
     def __init__(self, model, config, data_loaders, device, logger):
         self.model = model
         self.config = config
@@ -31,144 +30,81 @@ class ContrastivePretraining:
     def contrastive_pretraining(self, epochs: int = 50, patience: int = 20) -> Dict[str, Any]:
         """Contrastive Learning Pretraining Phase with PK-PD Integration"""
         self.logger.info(f"Starting Enhanced Contrastive Pretraining - Epochs: {epochs}")
-        
-        # Train PK predictor for PD enhancement
+
         self._train_pk_predictor()
         
-        # Pretraining state
-        pretraining_history = {'contrastive_loss': [], 'learning_rate': []}
+        pt_history = {'total_loss': [], 'contrastive_loss': [], 'clf_loss': [], 'learning_rate': []}
         
-        # Pretraining optimizer (separate from main training)
-        pretraining_optimizer = torch.optim.AdamW(
+        pt_optimizer = torch.optim.AdamW(
             self.model.parameters(), 
             lr=self.config.learning_rate * 2, 
             weight_decay=1e-4
         )
-        pretraining_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            pretraining_optimizer, T_max=epochs
-        )
+        pt_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(pt_optimizer, T_max=epochs)
 
-        best_contrastive_loss = float('inf')
+        best_loss = float('inf')
         best_epoch = 0
         patience_counter = 0
         for epoch in range(epochs):
-            contrastive_loss = self._enhanced_pretraining_epoch(pretraining_optimizer)
+            ct_loss = self._enhanced_pretraining_epoch(pt_optimizer)
+            if self.config.use_pt_clf: 
+                clf_loss = self._pretraining_epoch_clf(pt_optimizer)
+                total_loss = ct_loss + 10* clf_loss
+            else:
+                clf_loss = 0.0
+                total_loss = ct_loss   
+                
+            pt_history['total_loss'].append(total_loss)
+            pt_history['contrastive_loss'].append(ct_loss)
+            pt_history['clf_loss'].append(clf_loss)
+            pt_history['learning_rate'].append(pt_optimizer.param_groups[0]['lr'])
             
-            pretraining_history['contrastive_loss'].append(contrastive_loss)
-            pretraining_history['learning_rate'].append(pretraining_optimizer.param_groups[0]['lr'])
-            
-            pretraining_scheduler.step()
+            pt_scheduler.step()
             
             if epoch % 10 == 0 or epoch == epochs - 1:
                 self.logger.info(
                     f"Pretraining Epoch {epoch:3d} | "
-                    f"Contrastive Loss: {contrastive_loss:.6f} | "
-                    f"Best Loss: {best_contrastive_loss:.6f}"
+                    f"Total Loss: {total_loss:.6f} | "
+                    f"Contrastive Loss: {ct_loss:.6f} | "
+                    f"CLF Loss: {clf_loss:.6f} | "
+                    f"Best Loss: {best_loss:.6f} | "
+                    f"at Epoch: {best_epoch}"
                 )
             
-            if contrastive_loss < best_contrastive_loss:
-                best_contrastive_loss = contrastive_loss
+            if total_loss < best_loss:
+                best_loss = total_loss
                 best_epoch = epoch
                 patience_counter = 0
                 self._save_pretrained_model()
             else:
                 patience_counter += 1
                 if patience_counter >= patience:
-                    self.logger.info(f"Early stopping at epoch {epoch} with best loss: {best_contrastive_loss:.6f}")
+                    self.logger.info(f"Early stopping at epoch {epoch} with best loss: {best_loss:.6f}")
                     break
         
-        self.logger.info(f"Enhanced Contrastive Pretraining completed - Best Loss: {best_contrastive_loss:.6f}")
+        self.logger.info(f"Enhanced Contrastive Pretraining completed - Best Loss: {best_loss:.6f}")
         
         return {
-            'best_contrastive_loss': best_contrastive_loss,
-            'pretraining_history': pretraining_history,
+            'best_loss': best_loss,
+            'pretraining_history': pt_history,
             'epochs_pretrained': best_epoch + 1
         }
-    
-    def _pretraining_epoch(self, optimizer) -> float:
-        """Single pretraining epoch using contrastive learning with PK label integration"""
-        self.model.train()
-        total_contrastive_loss = 0.0
-        num_batches = 0
-        pretraining_loaders = self._get_pretraining_loaders()
-        
-        # Process PK batches
-        for batch_pk in pretraining_loaders[0]:  # PK loader
-            optimizer.zero_grad()
-            
-            # Move batch to device
-            batch_pk = self._to_device(batch_pk)
-            batch_pk_dict = self._convert_batch_to_dict(batch_pk, 'pk')
-            
-            # Contrastive learning for PK
-            if batch_pk_dict is not None:
-                pk_contrastive_loss = self._compute_contrastive_loss(batch_pk_dict, 'pk')
-                
-                pk_contrastive_loss.backward()
-                optimizer.step()
-                
-                total_contrastive_loss += pk_contrastive_loss.item()
-                num_batches += 1
-        
-        # Process PD batches with PK label integration
-        for batch_pd in pretraining_loaders[1]:  # PD loader
-            optimizer.zero_grad()
-            
-            # Move batch to device
-            batch_pd = self._to_device(batch_pd)
-            batch_pd_dict = self._convert_batch_to_dict(batch_pd, 'pd')
-            
-            # Contrastive learning for PD with PK label integration
-            if batch_pd_dict is not None:
-                pd_contrastive_loss = self._compute_contrastive_loss_with_pk_labels(batch_pd_dict, 'pd')
-                
-                pd_contrastive_loss.backward()
-                optimizer.step()
-                
-                total_contrastive_loss += pd_contrastive_loss.item()
-                num_batches += 1
-        
-        return total_contrastive_loss / num_batches if num_batches > 0 else 0.0
     
     def _compute_contrastive_loss(self, batch_dict: Dict[str, Any], task: str) -> torch.Tensor:
         """Compute contrastive loss for specific task"""
         if not hasattr(self, 'contrastive_learning') or self.contrastive_learning is None:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
+            
+        x = batch_dict['x']
+        if task == 'pd' and 'pk_labels' in batch_dict:
+            pk_labels = batch_dict['pk_labels']
+            x = torch.cat([x, pk_labels.unsqueeze(-1) if pk_labels.dim() == 1 else pk_labels], dim=1)
         
-        # Get input data
-        # Get encoder for the task
-        if task == 'pk':
-            x = batch_dict['x']
-            if hasattr(self.model, 'pk_model') and self.model.pk_model is not None:
-                encoder = self.model.pk_model['encoder']
-            elif hasattr(self.model, 'pk_encoder'):
-                encoder = self.model.pk_encoder
-            elif hasattr(self.model, 'shared_encoder'):
-                encoder = self.model.shared_encoder
-            else:
-                encoder = self.model.encoder
-        elif task == 'pd':
-            if self.config.mode in ["separate", "joint", "dual_stage", "integrated"]:
-                x = torch.cat([batch_dict['x'], batch_dict['pk_labels']], dim=1)
-            else:
-                x = batch_dict['x']
-            if hasattr(self.model, 'pd_model') and self.model.pd_model is not None:
-                encoder = self.model.pd_model['encoder']
-            elif hasattr(self.model, 'pd_encoder'):
-                encoder = self.model.pd_encoder
-            elif hasattr(self.model, 'shared_encoder'):
-                encoder = self.model.shared_encoder
-            else:
-                encoder = self.model.encoder
-        else:
-            raise ValueError(f"Unknown task: {task}")
+        encoder = self._get_encoder(self.model, task)
         
-        # Check if encoder exists and has the right input dimension
         if encoder is None:
             return torch.tensor(0.0, device=x.device, requires_grad=True)
 
-      
-        # Compute SimCLR contrastive loss
         return self.contrastive_learning.contrastive_loss(x, encoder)
     
     def _compute_contrastive_loss_with_pk_labels(self, batch_dict: Dict[str, Any], task: str) -> torch.Tensor:
@@ -176,104 +112,53 @@ class ContrastivePretraining:
         if not hasattr(self, 'contrastive_learning') or self.contrastive_learning is None:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
         
-        # Get input data
         x = batch_dict['x']
-        
-        # For PD task, try to get PK labels if available
         if task == 'pd' and 'pk_labels' in batch_dict:
             pk_labels = batch_dict['pk_labels']
-            # Concatenate PK labels to PD input for enhanced representation
             x_enhanced = torch.cat([x, pk_labels.unsqueeze(-1) if pk_labels.dim() == 1 else pk_labels], dim=1)
         else:
             x_enhanced = x
         
-        # Get encoder for the task
-        if task == 'pk':
-            if hasattr(self.model, 'pk_model') and self.model.pk_model is not None:
-                encoder = self.model.pk_model['encoder']
-            elif hasattr(self.model, 'pk_encoder'):
-                encoder = self.model.pk_encoder
-            elif hasattr(self.model, 'shared_encoder'):
-                encoder = self.model.shared_encoder
-            else:
-                encoder = self.model.encoder
-        elif task == 'pd':
-            if hasattr(self.model, 'pd_model') and self.model.pd_model is not None:
-                encoder = self.model.pd_model['encoder']
-            elif hasattr(self.model, 'pd_encoder'):
-                encoder = self.model.pd_encoder
-            elif hasattr(self.model, 'shared_encoder'):
-                encoder = self.model.shared_encoder
-            else:
-                encoder = self.model.encoder
-        else:
-            raise ValueError(f"Unknown task: {task}")
-        
-        # Check if encoder exists
-        if encoder is None:
-            return torch.tensor(0.0, device=x.device, requires_grad=True)
-        
-        # For enhanced input, we need to handle dimension mismatch
-        try:
-            # Test if encoder can handle the enhanced input
-            with torch.no_grad():
-                _ = encoder(x_enhanced[:1])  # Test with single sample
-        except RuntimeError as e:
-            if "mat1 and mat2 shapes cannot be multiplied" in str(e):
-                # Fall back to original input if enhanced input doesn't work
-                self.logger.debug(f"Enhanced input failed, using original input: {e}")
-                x_enhanced = x
-            else:
-                raise e
-        
-        # Compute SimCLR contrastive loss with enhanced input
+        encoder = self._get_encoder(self.model, task)
+               
         return self.contrastive_learning.contrastive_loss(x_enhanced, encoder)
     
     def _train_pk_predictor(self):
         """Train PK predictor using PK data (train + val, exclude test)"""
         self.logger.info("Training PK predictor for enhanced PD pretraining...")
         
-        # Get PK data for training predictor (train + val)
         pk_batches = list(self.data_loaders.get('train_pk', [])) + list(self.data_loaders.get('val_pk', []))
         if not pk_batches:
             self.logger.warning("No PK data available for predictor training")
             return
-        
-        # Collect PK data
-        pk_features_list = []
-        pk_targets_list = []
-        
+        pk_feats, pk_targets, pk_targets_clf = [], [], []
         for batch in pk_batches:
             batch = self._to_device(batch)
             if isinstance(batch, (list, tuple)):
-                x, y = batch
-                batch_dict = {'x': x, 'y': y}
+                x, y, y_clf = batch
+                batch_dict = {'x': x, 'y': y, 'y_clf': y_clf}
             else:
                 batch_dict = batch
-            
-            pk_features_list.append(batch_dict['x'])
-            pk_targets_list.append(batch_dict['y'])
+            pk_feats.append(batch_dict['x'])
+            pk_targets.append(batch_dict['y'])
+            pk_targets_clf.append(batch_dict['y_clf'])
         
-        # Concatenate all PK data
-        pk_features = torch.cat(pk_features_list, dim=0)
-        pk_targets = torch.cat(pk_targets_list, dim=0)
-        
-        # Train PK predictor
-        pk_data = {'x': pk_features, 'y': pk_targets}
-        pd_data = {'x': pk_features, 'y': pk_targets}  # Dummy for now
-        
-        self.pk_integrator.train_pk_predictor(pk_data, pd_data)
-        self.logger.info("PK predictor training completed")
+        pk_feats = torch.cat(pk_feats, dim=0)
+        pk_targets = torch.cat(pk_targets, dim=0)
+        pk_targets_clf = torch.cat(pk_targets_clf, dim=0)
 
+        pk_data = {'x': pk_feats, 'y': pk_targets, 'y_clf': pk_targets_clf}
+        
+        self.pk_integrator.train_pk_predictor(pk_data)
+        self.logger.info("PK predictor training completed")
 
     def _enhanced_pretraining_epoch(self, optimizer) -> float:
         """Enhanced pretraining epoch with PK-PD integration (train + val)"""
         self.model.train()
+        
         total_contrastive_loss = 0.0
         num_batches = 0
-        
-        # Get enhanced PD batches with PK labels (train + val)
-        enhanced_pd_batches = self._get_enhanced_pd_batches()
+        pd_batches_with_pk = self._get_pd_batches_with_pk()
         
         # Process PK batches (train + val)
         all_pk_batches = list(self.data_loaders.get('train_pk', [])) + list(self.data_loaders.get('val_pk', []))
@@ -292,10 +177,10 @@ class ContrastivePretraining:
                 num_batches += 1
         
         # Process enhanced PD batches
-        for enhanced_pd_batch in enhanced_pd_batches:
+        for enhanced_pd_batch in pd_batches_with_pk:
             optimizer.zero_grad()
-            
             total_pd_loss = self._compute_contrastive_loss(enhanced_pd_batch, 'pd')
+
             total_pd_loss.backward()
             optimizer.step()
             
@@ -304,8 +189,24 @@ class ContrastivePretraining:
         
         return total_contrastive_loss / num_batches if num_batches > 0 else 0.0
 
+    def _pretraining_epoch_clf(self, optimizer) -> float:
+        """Pretraining epoch with classification task"""
+        self.model.train()
+        total_pd_loss = 0.0
+        num_batches = 0
 
-    def _get_enhanced_pd_batches(self) -> List[Dict[str, Any]]:
+        pd_batches_with_pk = self._get_pd_batches_with_pk()
+        for pd_batch_with_pk in pd_batches_with_pk:
+            optimizer.zero_grad()
+            pd_loss = self._compute_classification_loss(pd_batch_with_pk, 'pd')
+            pd_loss.backward()
+            optimizer.step()
+            total_pd_loss += pd_loss.item()
+            num_batches += 1
+            
+        return total_pd_loss / num_batches if num_batches > 0 else 0.0
+
+    def _get_pd_batches_with_pk(self) -> List[Dict[str, Any]]:
         """Get enhanced PD batches with PK labels (train + val)"""
         enhanced_batches = []
         all_pd_batches = list(self.data_loaders.get('train_pd', [])) + list(self.data_loaders.get('val_pd', []))
@@ -313,7 +214,6 @@ class ContrastivePretraining:
         for batch_pd in all_pd_batches:
             batch_pd = self._to_device(batch_pd)
             batch_pd_dict = self._convert_batch_to_dict(batch_pd, 'pd')
-            
             # Enhance with PK labels
             enhanced_batch = self.pk_integrator.enhance_pd_batch_with_pk_labels(batch_pd_dict)
             enhanced_batches.append(enhanced_batch)
@@ -326,44 +226,20 @@ class ContrastivePretraining:
         if not hasattr(self, 'contrastive_learning') or self.contrastive_learning is None:
             return torch.tensor(0.0, device=self.device, requires_grad=True)
         
-        # Get PD features
         pd_x = enhanced_pd_batch['x']
         pk_labels = enhanced_pd_batch.get('pk_labels', None)
         
-        # Get encoders
-        if hasattr(self.model, 'pk_model') and self.model.pk_model is not None:
-            pk_encoder = self.model.pk_model['encoder']
-        elif hasattr(self.model, 'pk_encoder'):
-            pk_encoder = self.model.pk_encoder
-        elif hasattr(self.model, 'shared_encoder'):
-            pk_encoder = self.model.shared_encoder
-        else:
-            pk_encoder = self.model.encoder
+        pk_encoder = self._get_encoder(self.model, 'pk')
+        pd_encoder = self._get_encoder(self.model, 'pd')
         
-        if hasattr(self.model, 'pd_model') and self.model.pd_model is not None:
-            pd_encoder = self.model.pd_model['encoder']
-        elif hasattr(self.model, 'pd_encoder'):
-            pd_encoder = self.model.pd_encoder
-        elif hasattr(self.model, 'shared_encoder'):
-            pd_encoder = self.model.shared_encoder
-        else:
-            pd_encoder = self.model.encoder
-        
-        # Get PK and PD features
         try:
             if pk_labels is not None:
-                # Use PK labels as PK features
-                pk_features = pk_labels.unsqueeze(-1) if pk_labels.dim() == 1 else pk_labels
+                z_pk = pk_labels.unsqueeze(-1) if pk_labels.dim() == 1 else pk_labels
             else:
-                # Fallback to PK encoder
-                pk_features = pk_encoder(pd_x)
+                z_pk = pk_encoder(pd_x)
             
-            pd_features = pd_encoder(pd_x)
-            
-            # Compute cross-modal contrastive loss
-            cross_modal_loss = self.cross_modal_learning.compute_cross_modal_loss(
-                pk_features, pd_features
-            )
+            z_pd = pd_encoder(pd_x)
+            cross_modal_loss = self.cross_modal_learning.compute_cross_modal_loss(z_pk, z_pd)
             
             return cross_modal_loss
             
@@ -378,13 +254,12 @@ class ContrastivePretraining:
     def _convert_batch_to_dict(self, batch: Any, task: str) -> Dict[str, Any]:
         """Convert batch to dictionary format"""
         if isinstance(batch, (list, tuple)):
-            x, y = batch
-            return {'x': x, 'y': y}
+            x, y, y_clf = batch
+            return {'x': x, 'y': y, 'y_clf': y_clf}
         elif isinstance(batch, dict):
             return batch
         else:
-            # Handle other batch formats
-            return {'x': batch, 'y': None}
+            return {'x': batch, 'y': None, 'y_clf': None}
     
     def _save_pretrained_model(self):
         """Save pretrained model"""
@@ -423,3 +298,122 @@ class ContrastivePretraining:
     def set_contrastive_learning(self, contrastive_learning):
         """Set contrastive learning instance"""
         self.contrastive_learning = contrastive_learning
+
+    def _compute_classification_loss(self, batch_dict: Dict[str, Any], task: str) -> torch.Tensor:
+
+        x = torch.cat([batch_dict['x'], batch_dict['pk_labels']], dim=1).to(self.device)
+        y_clf = batch_dict['y_clf'].long().view(-1).to(self.device)  # [B]
+        # y = batch_dict['y'].long().view(-1).to(self.device)  # [B]
+
+        encoder = self._get_encoder(self.model, task)
+
+        z = encoder(x)
+        logits = self.model.head_clf(z)  # [B, 2]
+
+        loss = F.cross_entropy(logits['pred'], y_clf)
+        return loss
+
+    def _get_encoder(self, model, task: str):
+        """Get encoder for specific task"""
+        if task == 'pk':
+            if hasattr(model, 'pk_encoder'):
+                return model.pk_encoder
+            else:
+                return model.encoder
+        elif task == 'pd':
+            if hasattr(model, 'pd_encoder'):
+                return model.pd_encoder
+            else:
+                return model.encoder
+        else:
+            raise ValueError(f"Unknown task: {task}")
+    
+
+class PKPredictor(nn.Module):
+    """Simple linear model to predict PK labels from PK features"""
+    def __init__(self, input_dim: int, output_dim: int = 1):
+        super().__init__()
+        self.linear = nn.Linear(input_dim, output_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear(x)
+
+
+class PKLabelIntegrator:
+    """Handles training of PK predictor and integration of PK labels into PD batches."""
+    def __init__(self, logger):
+        self.pk_predictor = None
+        self.logger = logger
+
+    def train_pk_predictor(self, pk_data: Dict[str, torch.Tensor], epochs: int = 50):
+        """
+        Trains a simple PK predictor using PK data.
+        pk_data: {'x': pk_features, 'y': pk_targets}
+        """
+        self.logger.info("Training PK predictor for PD pretraining...")
+        
+        pk_feats = pk_data['x']
+        pk_targets = pk_data['y']
+
+        input_dim = pk_feats.shape[-1]
+        self.pk_predictor = PKPredictor(input_dim).to(pk_feats.device)
+        optimizer = optim.Adam(self.pk_predictor.parameters(), lr=0.001)
+        criterion = nn.MSELoss()
+
+        # Simple training loop for the predictor
+        for epoch in range(epochs):  # Small number of epochs
+            optimizer.zero_grad()
+            predictions = self.pk_predictor(pk_feats)
+            loss = criterion(predictions.squeeze(), pk_targets.squeeze())
+            loss.backward()
+            optimizer.step()
+        self.logger.info("PK predictor trained successfully")
+
+    def enhance_pd_batch_with_pk_labels(self, pd_batch: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Enhances a PD batch by adding predicted PK labels.
+        Requires pk_predictor to be trained.
+        """
+        if self.pk_predictor is None:
+            self.logger.warning("PK predictor not trained. Cannot enhance PD batch with PK labels.")
+            return pd_batch
+        pk_pred = self.pk_predictor(pd_batch['x'])
+        pd_batch_new = pd_batch.copy()
+        pd_batch_new['pk_labels'] = pk_pred.detach() # Detach to prevent gradients flowing back to predictor during CL
+        return pd_batch_new
+
+
+class CrossModalContrastiveLearning:
+    """
+    Handles cross-modal contrastive learning between PK and PD representations.
+    """
+    def __init__(self, temperature: float = 0.1):
+        self.temperature = temperature
+
+    def compute_cross_modal_loss(self, pk_features: torch.Tensor, pd_features: torch.Tensor) -> torch.Tensor:
+        """
+        Computes InfoNCE loss between PK and PD features.
+        Assumes pk_features and pd_features are already representations (e.g., from encoders).
+        """
+        import torch.nn.functional as F
+        
+        batch_size = pk_features.size(0)
+        
+        if batch_size < 2:
+            return torch.tensor(0.0, device=pk_features.device, requires_grad=True)
+
+        # Normalize features
+        pk_features = F.normalize(pk_features, dim=1)
+        pd_features = F.normalize(pd_features, dim=1)
+
+        # Compute similarity matrix between PK and PD features
+        # Shape: (batch_size, batch_size)
+        similarity_matrix = torch.matmul(pk_features, pd_features.T) / self.temperature
+
+        # Positive pairs are (pk_i, pd_i)
+        labels = torch.arange(batch_size, device=pk_features.device)
+
+        # InfoNCE Loss
+        loss = F.cross_entropy(similarity_matrix, labels)
+        
+        return loss

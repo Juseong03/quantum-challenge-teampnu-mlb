@@ -125,19 +125,12 @@ def split_dataset(
     if id_col not in df.columns:
         raise ValueError(f"ID column not found: '{id_col}'")
 
-
-    df = df.copy()
-    id_col = id_col or _detect_id_col(df)
-    if id_col not in df.columns:
-        raise ValueError(f"ID column not found: '{id_col}'")
-
     rng = np.random.RandomState(random_state)
     all_ids = np.array(sorted(df[id_col].unique()))
     strategy = normalize_split_strategy(strategy)
 
     if strategy == "random_subject":
         tr_ids, te_ids = _split_ids(all_ids, test_size, rng)
-        # Maintain global ratio: adjust val ratio in train set to (val_size / (1 - test_size))
         denom = max(1e-9, (1.0 - (len(te_ids) / max(1, len(all_ids)))))
         adj_val = min(0.99, max(0.0, val_size / denom))
         tr_ids, va_ids = _split_ids(tr_ids, adj_val, rng)
@@ -157,21 +150,15 @@ def split_dataset(
             bins.loc[nonzero.index] = qbins.astype(str)
 
         tr_ids, va_ids, te_ids = [], [], []
-        # Apply same adjustment per bin to maintain global ratio
         for bin_name, idx in bins.groupby(bins):
             ids_b = np.array(sorted(idx.index))
-            
-            # Handle small bins properly
             if len(ids_b) < 3:
-                # Too few subjects in this bin, assign to train
                 tr_ids.extend(ids_b)
                 continue
             
-            # Use consistent random state for all bins
             bin_rng = rng
             tr_b, te_b = _split_ids(ids_b, test_size, bin_rng)
             
-            # Adjust global val ratio within bin as well
             denom_b = max(1e-9, (1.0 - (len(te_b) / max(1, len(ids_b)))))
             adj_val_b = min(0.99, max(0.0, val_size / denom_b))
             tr_b, va_b = _split_ids(tr_b, adj_val_b, bin_rng)
@@ -191,14 +178,12 @@ def split_dataset(
                                   if any(np.isclose(v, e, atol=1e-6) for e in excl)]))
         remain = np.array(sorted(np.setdiff1d(all_ids, te_ids)))
 
-        # Global ratio adjustment: adjust val ratio in remaining considering test ratio
         test_ratio = len(te_ids) / max(1, len(all_ids))
         denom = max(1e-9, 1.0 - test_ratio)
         adj_val = min(0.99, max(0.0, val_size / denom))
         tr_ids, va_ids = _split_ids(remain, adj_val, rng)
 
     elif strategy == "stratify_dose_even_no_placebo_test":
-        # Same as stratify_dose_even but exclude dose=0 from test set
         dose_col = dose_col or _first_existing(df, ["DOSE", "AMT"]) or "DOSE"
         if dose_col not in df.columns:
             raise ValueError("dose_col not found.")
@@ -237,7 +222,6 @@ def split_dataset(
                 n_test = max(1, int(len(bin_ids) * test_size))
                 n_val = max(1, int(len(bin_ids) * val_size))
                 n_tr = len(bin_ids) - n_test - n_val
-                
                 # Shuffle and assign
                 rng.shuffle(bin_ids)
                 tr_ids.extend(bin_ids[:n_tr])
@@ -437,7 +421,7 @@ def choose_universe_and_build_split_df(
     df_final: pd.DataFrame,
     df_dose: Optional[pd.DataFrame] = None,
     *,
-    id_universe: str = 'union'
+    id_universe: str = 'interaction'
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, pd.DataFrame]:
     """
     Select PK/PD universe from df_final and construct representative DOSE for splitting.
@@ -477,7 +461,10 @@ def choose_universe_and_build_split_df(
     # Merge: dosing-based first, if not available use observation-based
     dose_grp = rep_from_dose.reindex(list(used))
     dose_grp = dose_grp.fillna(rep_from_obs)
+    if dose_grp.isna().any():
+        print("[WARN] Some subjects have missing DOSE info, set to 0.0 (placebo).")
     dose_grp = dose_grp.fillna(0.0)
+
 
     df_universe = df_universe.merge(dose_grp.rename("DOSE_SPLIT"), left_on='ID', right_index=True, how='left')
 
@@ -555,8 +542,6 @@ def report_dose_and_bw(df: pd.DataFrame, tag: str, topn: int = 5):
 def prepare_for_split(
     df_final: pd.DataFrame,
     df_dose: pd.DataFrame,
-    pk_df: pd.DataFrame,
-    pd_df: pd.DataFrame,
     *,
     split_strategy,
     test_size: float,
@@ -570,7 +555,7 @@ def prepare_for_split(
     verbose: bool = True,
 ):
     """Prepare global PK/PD splits under a chosen universe and strategy."""
-    df_univ, pk_df_u, pd_df_u, dose_grp_obs, df_for_split = choose_universe_and_build_split_df(
+    df_univ, pk_df, pd_df, dose_grp_obs, df_for_split = choose_universe_and_build_split_df(
         df_final, df_dose=df_dose, id_universe=id_universe
     )
 
@@ -598,25 +583,29 @@ def prepare_for_split(
             split_kwargs["quantile_range"] = bw_quantiles
         else:
             raise ValueError("only_bw_range requires bw_range or bw_quantiles.")
-    elif strategy == "robust_deterministic":
-        # Use the new robust deterministic splitter
-        splitter = RobustDeterministicSplitter(random_state=random_state)
-        pk_splits, pd_splits, global_splits, _ = splitter.split_data_robustly(
-            df_univ, df_dose, pk_df_u, pd_df_u, test_size, val_size
-        )
-        return pk_splits, pd_splits, global_splits, df_for_split
     elif strategy in ["stratify_bw_even", "leave_high_bw_out"]:
-        # BW-based splitting strategies
         split_kwargs["bw_col"] = 'BW'
         if strategy == "stratify_bw_even":
             split_kwargs["n_bw_bins"] = 4
 
-    global_splits = split_dataset(df_for_split, **split_kwargs)
-    pk_splits = project_split(pk_df_u, global_splits)
-    pd_splits = project_split(pd_df_u, global_splits)
+    # Weekly flag 0: Daily, 1: Weekly
+    if 'WEEKLY' in df_for_split.columns:
+        daily_df = df_for_split[df_for_split["WEEKLY"] == 0]
+        global_splits = split_dataset(daily_df, **split_kwargs)
+        weekly_df = df_for_split[df_for_split["WEEKLY"] == 1]
+        for split in ["train"]:
+            ids = global_splits[split]["ID"].unique()
+            wk_extra = weekly_df[weekly_df["ID"].isin(ids)]
+            global_splits[split] = pd.concat([global_splits[split], wk_extra], ignore_index=True)
+    else:
+        global_splits = split_dataset(df_for_split, **split_kwargs)
 
-    pk_ids_u = set(pk_df_u["ID"].unique())
-    pd_ids_u = set(pd_df_u["ID"].unique())
+    # global_splits = split_dataset(df_for_split, **split_kwargs)
+    pk_splits = project_split(pk_df, global_splits)
+    pd_splits = project_split(pd_df, global_splits)
+
+    pk_ids_u = set(pk_df["ID"].unique())
+    pd_ids_u = set(pd_df["ID"].unique())
     used_ids = pk_ids_u | pd_ids_u if id_universe == 'union' else (pk_ids_u & pd_ids_u)
     for k in ("train","val","test"):
         pk_ids_k = set(pk_splits[k]["ID"].unique())
@@ -635,169 +624,3 @@ def prepare_for_split(
         report_dose_and_bw(global_splits['test'],  "Test (matched IDs)")
 
     return pk_splits, pd_splits, global_splits, df_for_split
-
-
-# =========================================================
-# Robust Deterministic Data Splitter
-# =========================================================
-class RobustDeterministicSplitter:
-    """
-    Robust Deterministic Data Splitter
-    
-    Solves the issues with stratify_dose_even:
-    1. ✅ Consistent splits across runs (deterministic)
-    2. ✅ Subject integrity (same subject in same split)
-    3. ✅ Balanced dose distribution
-    4. ✅ Handles small bins properly
-    """
-    
-    def __init__(self, random_state: int = 42):
-        self.random_state = random_state
-        np.random.seed(random_state)
-        torch.manual_seed(random_state)
-    
-    def split_data_robustly(self, df_final, df_dose, pk_df, pd_df, 
-                           test_size=0.1, val_size=0.1, min_subjects_per_bin=3):
-        """
-        Split data robustly with dose stratification and subject integrity
-        
-        Args:
-            df_final: Final processed dataframe
-            df_dose: Dose dataframe
-            pk_df: PK dataframe
-            pd_df: PD dataframe
-            test_size: Test set size ratio
-            val_size: Validation set size ratio
-            min_subjects_per_bin: Minimum subjects per dose bin
-            
-        Returns:
-            Tuple of (pk_splits, pd_splits, global_splits, None)
-        """
-        print("🔄 Robust Deterministic Data Splitting")
-        print("=" * 50)
-        
-        # Get subject dose information
-        dose_col = _first_existing(df_final, ["DOSE", "AMT"]) or "DOSE"
-        subj_dose = _subject_primary_dose(df_final, id_col="ID", dose_col=dose_col)
-        
-        # Create dose bins deterministically
-        dose_bins = self._create_dose_bins_deterministically(subj_dose, min_subjects_per_bin)
-        
-        # Split subjects within each bin deterministically
-        train_subjects, val_subjects, test_subjects = self._split_subjects_by_bins(
-            dose_bins, test_size, val_size
-        )
-        
-        print(f"   Total subjects: {len(subj_dose)}")
-        print(f"   Train subjects: {len(train_subjects)}")
-        print(f"   Val subjects: {len(val_subjects)}")
-        print(f"   Test subjects: {len(test_subjects)}")
-        
-        # Create splits based on subject IDs
-        pk_splits = {
-            'train': pk_df[pk_df['ID'].isin(train_subjects)].copy(),
-            'val': pk_df[pk_df['ID'].isin(val_subjects)].copy(),
-            'test': pk_df[pk_df['ID'].isin(test_subjects)].copy()
-        }
-        
-        pd_splits = {
-            'train': pd_df[pd_df['ID'].isin(train_subjects)].copy(),
-            'val': pd_df[pd_df['ID'].isin(val_subjects)].copy(),
-            'test': pd_df[pd_df['ID'].isin(test_subjects)].copy()
-        }
-        
-        # Create global splits
-        global_splits = {
-            'train': df_final[df_final['ID'].isin(train_subjects)].copy(),
-            'val': df_final[df_final['ID'].isin(val_subjects)].copy(),
-            'test': df_final[df_final['ID'].isin(test_subjects)].copy()
-        }
-        
-        print(f"   PK splits: Train={pk_splits['train'].shape}, Val={pk_splits['val'].shape}, Test={pk_splits['test'].shape}")
-        print(f"   PD splits: Train={pd_splits['train'].shape}, Val={pd_splits['val'].shape}, Test={pd_splits['test'].shape}")
-        
-        return pk_splits, pd_splits, global_splits, None
-    
-    def _create_dose_bins_deterministically(self, subj_dose, min_subjects_per_bin):
-        """Create dose bins deterministically"""
-        # Separate placebo and non-placebo
-        zero_mask = subj_dose.eq(0.0)
-        placebo_subjects = subj_dose[zero_mask].index.tolist()
-        nonzero_subjects = subj_dose[~zero_mask]
-        
-        bins = {}
-        
-        # Placebo bin
-        if len(placebo_subjects) >= min_subjects_per_bin:
-            bins["placebo"] = placebo_subjects
-        else:
-            # If too few placebo subjects, merge with lowest dose bin
-            bins["low_dose"] = placebo_subjects
-        
-        # Non-placebo bins
-        if len(nonzero_subjects) > 0:
-            # Sort by dose and create bins
-            sorted_subjects = nonzero_subjects.sort_values().index.tolist()
-            
-            # Create 2-3 bins for non-placebo doses
-            n_bins = min(3, max(2, len(sorted_subjects) // min_subjects_per_bin))
-            bin_size = len(sorted_subjects) // n_bins
-            
-            for i in range(n_bins):
-                start_idx = i * bin_size
-                end_idx = (i + 1) * bin_size if i < n_bins - 1 else len(sorted_subjects)
-                bin_subjects = sorted_subjects[start_idx:end_idx]
-                
-                if len(bin_subjects) >= min_subjects_per_bin:
-                    bin_name = f"dose_bin_{i+1}"
-                    bins[bin_name] = bin_subjects
-                else:
-                    # Merge with previous bin if too small
-                    if bins:
-                        last_bin = list(bins.keys())[-1]
-                        bins[last_bin].extend(bin_subjects)
-                    else:
-                        bins["low_dose"] = bin_subjects
-        
-        return bins
-    
-    def _split_subjects_by_bins(self, dose_bins, test_size, val_size):
-        """Split subjects within each bin deterministically"""
-        train_subjects = []
-        val_subjects = []
-        test_subjects = []
-        
-        for bin_name, subjects in dose_bins.items():
-            # Sort subjects deterministically
-            sorted_subjects = sorted(subjects)
-            
-            # Calculate split sizes for this bin
-            n_subjects = len(sorted_subjects)
-            n_test = max(1, int(n_subjects * test_size))
-            n_val = max(1, int(n_subjects * val_size))
-            n_train = n_subjects - n_test - n_val
-            
-            # Ensure at least 1 subject in each split
-            if n_train < 1:
-                n_train = 1
-                n_val = max(1, n_subjects - n_train - 1)
-                n_test = n_subjects - n_train - n_val
-            
-            # Split deterministically
-            train_subjects.extend(sorted_subjects[:n_train])
-            val_subjects.extend(sorted_subjects[n_train:n_train + n_val])
-            test_subjects.extend(sorted_subjects[n_train + n_val:])
-            
-            print(f"   {bin_name}: {n_subjects} subjects -> Train:{n_train}, Val:{n_val}, Test:{n_test}")
-        
-        return train_subjects, val_subjects, test_subjects
-
-# Legacy class for backward compatibility
-class DeterministicDataSplitter(RobustDeterministicSplitter):
-    """Legacy class - use RobustDeterministicSplitter instead"""
-    
-    def split_data_deterministically(self, df_final, df_dose, pk_df, pd_df, 
-                                   test_size=0.1, val_size=0.1):
-        """Legacy method - redirects to robust splitting"""
-        return self.split_data_robustly(df_final, df_dose, pk_df, pd_df, 
-                                      test_size, val_size)

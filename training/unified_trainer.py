@@ -1,13 +1,14 @@
 """
-Unified PK/PD Trainer - Refactored and Modular
+Unified PK/PD Trainer - Refactored and Modular (Improved)
 """
-
 import torch
 import torch.nn.functional as F
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 import time
 import numpy as np
+from collections import defaultdict
+import copy
 
 from utils.logging import get_logger
 from utils.helpers import get_device
@@ -15,15 +16,11 @@ from models.heads import _reg_metrics
 from utils.contrastive_learning import create_pkpd_contrastive_learning
 from utils.data_augmentation import create_data_augmentation
 from .loss_computation import LossComputation
-from .evaluation import ModelEvaluator
 from .pretraining import ContrastivePretraining
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 
 
 class UnifiedPKPDTrainer:
-    """
-    Unified PK/PD Trainer - All training modes supported (Refactored)
-    """
-    
     def __init__(self, model, config, data_loaders, device=None):
         self.model = model
         self.config = config
@@ -31,46 +28,42 @@ class UnifiedPKPDTrainer:
         self.device = device if device is not None else get_device()
         self.logger = get_logger(__name__)
         self.mode = config.mode
-        
+
         # Move model to device
         self.model.to(self.device)
-        
+
         # Setup components
         self._setup_optimizer()
         self._setup_model_save_directory()
         self._setup_components()
-        
+
         # Training state
         self.best_val_loss = float('inf')
         self.best_pk_rmse = float('inf')
         self.best_pd_rmse = float('inf')
         self.patience_counter = 0
         self.epoch = 0
-        self.training_history = {
-            'train_loss': [], 'val_loss': [], 'pk_train_loss': [], 'pd_train_loss': [], 
-            'pk_val_loss': [], 'pd_val_loss': [],
-            # Metrics
-            'pk_train_mse': [], 'pk_train_rmse': [], 'pk_train_mae': [], 'pk_train_r2': [],
-            'pd_train_mse': [], 'pd_train_rmse': [], 'pd_train_mae': [], 'pd_train_r2': [],
-            'pk_val_mse': [], 'pk_val_rmse': [], 'pk_val_mae': [], 'pk_val_r2': [],
-            'pd_val_mse': [], 'pd_val_rmse': [], 'pd_val_mae': [], 'pd_val_r2': []
-        }
-        
+        self.training_history = defaultdict(list)
+
         self.logger.info(f"Unified Trainer initialized - Mode: {self.mode}, Device: {self.device}")
         self.logger.info(f"Number of model parameters: {self._count_parameters()}")
-    
+
+    # =========================
+    # Setup
+    # =========================
     def _setup_optimizer(self):
         """Setup optimizer and scheduler"""
         self.optimizer = torch.optim.AdamW(
-            self.model.parameters(), 
+            self.model.parameters(),
             lr=self.config.learning_rate,
             weight_decay=1e-4
         )
-        
+
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', patience=self.config.patience//2, factor=0.5, verbose=True
+            self.optimizer, mode='min',
+            patience=self.config.patience // 2, factor=0.5
         )
-    
+
     def _setup_model_save_directory(self):
         """Setup model save directory"""
         if self.config.encoder_pk or self.config.encoder_pd:
@@ -79,37 +72,38 @@ class UnifiedPKPDTrainer:
             encoder_name = f"{pk_encoder}-{pd_encoder}"
         else:
             encoder_name = self.config.encoder
-        
-        # Unified structure: {run_name}/{mode}/{encoder}/s{random_state}/
+
         if hasattr(self.config, 'run_name') and self.config.run_name:
-            self.model_save_directory = Path(self.config.output_dir) / self.config.run_name / self.config.mode / encoder_name / f"s{self.config.random_state}"
+            self.model_save_directory = (
+                Path(self.config.output_dir)
+                / self.config.run_name / self.config.mode
+                / encoder_name / f"s{self.config.random_state}"
+            )
         else:
-            # Fallback to old structure
-            self.model_save_directory = Path(self.config.output_dir) / "models" / self.config.mode / encoder_name / f"s{self.config.random_state}"
+            self.model_save_directory = (
+                Path(self.config.output_dir)
+                / "models" / self.config.mode
+                / encoder_name / f"s{self.config.random_state}"
+            )
         self.model_save_directory.mkdir(parents=True, exist_ok=True)
-    
+
     def _setup_components(self):
         """Setup training components"""
         # Data augmentation
         self.data_augmentation = create_data_augmentation(self.config)
         if self.data_augmentation.aug_method:
             self.logger.info(f"Data augmentation enabled: {self.data_augmentation.aug_method}")
-        
+
         # Contrastive learning
-        if self.config.use_contrastive_pretraining:
+        if self.config.use_pt_contrast:
             self.contrastive_learning = create_pkpd_contrastive_learning(self.config)
             self.logger.info(f"PK/PD Contrastive Learning enabled - Augmentation: {self.config.aug_method}")
         else:
             self.contrastive_learning = None
-        
+
         # Loss computation
-        self.loss_computation = LossComputation(
-            self.model, self.config, self.data_augmentation, self.contrastive_learning
-        )
-        
-        # Evaluation
-        self.evaluator = ModelEvaluator(self.model, self.device, self.logger)
-        
+        self.loss_computation = LossComputation(self.config, self.data_augmentation, self.contrastive_learning)
+
         # Pretraining
         self.pretraining = ContrastivePretraining(
             self.model, self.config, self.data_loaders, self.device, self.logger
@@ -117,929 +111,241 @@ class UnifiedPKPDTrainer:
         self.pretraining.set_model_save_directory(self.model_save_directory)
         if self.contrastive_learning:
             self.pretraining.set_contrastive_learning(self.contrastive_learning)
-    
+
     def _count_parameters(self) -> int:
-        """Calculate number of model parameters"""
         return sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-    
+
+    # =========================
+    # Main training entry
+    # =========================
     def train(self) -> Dict[str, Any]:
-        """Main training loop with optional contrastive pretraining"""
         self.logger.info(f"Training start - Mode: {self.mode}, Epochs: {self.config.epochs}")
-        
-        # Contrastive pretraining phase
+
         pretraining_results = None
-        if getattr(self.config, 'use_contrastive_pretraining', False):
+        if getattr(self.config, 'use_pt_contrast', False):
             self.logger.info("Starting Contrastive Pretraining Phase...")
-            pretraining_epochs = getattr(self.config, 'pretraining_epochs', 50)
-            pretraining_patience = getattr(self.config, 'pretraining_patience', 20)
-            pretraining_results = self.pretraining.contrastive_pretraining(epochs=pretraining_epochs, patience=pretraining_patience)
-            
-            # Load pretrained model for supervised training
+            pretraining_results = self.pretraining.contrastive_pretraining(
+                epochs=getattr(self.config, 'pretraining_epochs', 50),
+                patience=getattr(self.config, 'pretraining_patience', 20)
+            )
             self.pretraining.load_pretrained_model()
-            self._pretraining_completed = True  # Mark pretraining as completed
+            self._pretraining_completed = True
             self.logger.info("Pretrained model loaded, starting supervised training...")
 
-        # Setup supervised training augmentation
         if getattr(self.config, 'use_aug_supervised', False) and self.data_augmentation.aug_method:
             self.logger.info(f"Supervised training augmentation enabled: {self.data_augmentation.aug_method}")
 
-        # Main supervised training
         if self.mode == "separate":
-            return self._train_separate_mode(pretraining_results)
+            return self._train_mode_separate(pretraining_results)
         else:
-            return self._train_standard_mode(pretraining_results)
-    
-    def _train_standard_mode(self, pretraining_results: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Standard training loop for joint, shared, etc. modes"""
+            return self._train_modes(pretraining_results)
+
+    # =========================
+    # Standard training loop
+    # =========================
+    def _train_modes(self, pretraining_results=None) -> Dict[str, Any]:
         start_time = time.time()
-        
+
         for epoch in range(self.config.epochs):
             self.epoch = epoch
-            
-            # Training
-            train_metrics = self._train_epoch()
-            
-            # Validation
-            val_metrics = self._validate_epoch()
-            
-            # Record metrics
+            train_metrics = self._train_epoch_standard()
+            val_metrics = self._validate_epoch_standard(self._get_val_loaders())
+
             self._log_metrics(epoch, train_metrics, val_metrics)
-            
-            # Learning rate scheduling
             self.scheduler.step(val_metrics['total_loss'])
-            
-            # Early stopping check
+
             if self._check_early_stopping(val_metrics['total_loss']):
                 self.logger.info(f"Early stopping - Epoch {epoch}")
                 break
-            
-            # Save best model
+
             if self._should_save_model(val_metrics):
                 self._save_best_model()
-        
-        training_time = time.time() - start_time
-        self.logger.info(f"Training completed - Time: {training_time:.2f} seconds")
-        
+
+        self.logger.info(f"Training completed - Time: {time.time() - start_time:.2f} seconds")
         return self._get_final_results()
-    
-    def _train_separate_mode(self, pretraining_results: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Separate mode training: Train PK completely first, then PD"""
+
+    # =========================
+    # Separate mode training
+    # =========================
+    def _train_mode_separate(self, pretraining_results=None) -> Dict[str, Any]:
         start_time = time.time()
-        
-        # Phase 1: Train PK model completely
+
         self.logger.info("=== PHASE 1: Training PK Model ===")
-        pk_results = self._train_pk_model()
-        
-        # Phase 2: Train PD model completely
+        pk_results = self._train_task("pk", "train_pk", "val_pk")
+
         self.logger.info("=== PHASE 2: Training PD Model ===")
-        pd_results = self._train_pd_model()
-        
-        training_time = time.time() - start_time
-        self.logger.info(f"Separate training completed - Time: {training_time:.2f} seconds")
-        
-        # Evaluate test set for separate mode
-        test_metrics = self.evaluator.evaluate_test_set(self.data_loaders, self.mode)
-        
-        # Combine results
-        final_results = {
+        pd_results = self._train_task("pd", "train_pd", "val_pd")
+
+        test_metrics = self._validate_epoch_standard(self._get_test_loaders())
+        return {
             'pk': pk_results,
             'pd': pd_results,
             'mode': 'separate',
-            'training_time': training_time,
+            'training_time': time.time() - start_time,
             'test_metrics': test_metrics
         }
-        
-        return final_results
-    
-    def _train_pk_model(self) -> Dict[str, Any]:
-        """Train PK model completely"""
-        self.logger.info("Starting PK model training...")
-        
-        # Reset best metrics for PK
-        self.best_pk_rmse = float('inf')
-        pk_epochs_without_improvement = 0
-        
+
+    def _train_task(self, task: str, train_key: str, val_key: str) -> Dict[str, Any]:
+        best_rmse = float('inf')
+        no_improve = 0
+
         for epoch in range(self.config.epochs):
             self.epoch = epoch
-            
-            # Train PK only
-            train_metrics = self._train_pk_epoch()
-            
-            # Validate PK only
-            val_metrics = self._validate_pk_epoch()
-            
-            # Log PK metrics
-            self.logger.info(f"PK Epoch {epoch:3d} | Train | Loss: {train_metrics['pk_loss']:.6f} | RMSE: {train_metrics['pk_rmse']:.6f} | R²: {train_metrics['pk_r2']:.4f}")
-            self.logger.info(f"PK Epoch {epoch:3d} | Valid | Loss: {val_metrics['pk_loss']:.6f} | RMSE: {val_metrics['pk_rmse']:.6f} | R²: {val_metrics['pk_r2']:.4f}")
-            
-            # Check for PK best model
-            if val_metrics['pk_rmse'] < self.best_pk_rmse:
-                self.best_pk_rmse = val_metrics['pk_rmse']
+            train_metrics = self._train_single_epoch(task, train_key, is_training=True)
+            val_metrics = self._train_single_epoch(task, val_key, is_training=False)
+
+            self.logger.info(
+                f"{task.upper()} Epoch {epoch:3d} | Train | "
+                f"Loss: {train_metrics[f'{task}_loss']:.6f} | RMSE: {train_metrics[f'{task}_rmse']:.6f} | R²: {train_metrics[f'{task}_r2']:.4f}"
+            )
+            self.logger.info(
+                f"{task.upper()} Epoch {epoch:3d} | Valid | "
+                f"Loss: {val_metrics[f'{task}_loss']:.6f} | RMSE: {val_metrics[f'{task}_rmse']:.6f} | R²: {val_metrics[f'{task}_r2']:.4f}"
+            )
+
+            if val_metrics[f"{task}_rmse"] < best_rmse:
+                best_rmse = val_metrics[f"{task}_rmse"]
                 self._save_best_model()
-                pk_epochs_without_improvement = 0
-                self.logger.info(f"New PK best model - RMSE: {self.best_pk_rmse:.6f}")
+                no_improve = 0
+                self.logger.info(f"New {task.upper()} best model - RMSE: {best_rmse:.6f}")
             else:
-                pk_epochs_without_improvement += 1
-            
-            # Early stopping for PK
-            if pk_epochs_without_improvement >= self.config.patience:
-                self.logger.info(f"PK early stopping - Epoch {epoch}")
+                no_improve += 1
+
+            if no_improve >= self.config.patience:
+                self.logger.info(f"{task.upper()} early stopping - Epoch {epoch}")
                 break
-        
-        self.logger.info(f"PK training completed - Best RMSE: {self.best_pk_rmse:.6f}")
-        return {'best_rmse': self.best_pk_rmse, 'epochs_trained': epoch + 1}
-    
-    def _train_pd_model(self) -> Dict[str, Any]:
-        """Train PD model completely"""
-        self.logger.info("Starting PD model training...")
-        
-        # Reset best metrics for PD
-        self.best_pd_rmse = float('inf')
-        pd_epochs_without_improvement = 0
-        
-        for epoch in range(self.config.epochs):
-            self.epoch = epoch
-            
-            # Train PD only
-            train_metrics = self._train_pd_epoch()
-            
-            # Validate PD only
-            val_metrics = self._validate_pd_epoch()
-            
-            # Log PD metrics
-            self.logger.info(f"PD Epoch {epoch:3d} | Train | Loss: {train_metrics['pd_loss']:.6f} | RMSE: {train_metrics['pd_rmse']:.6f} | R²: {train_metrics['pd_r2']:.4f}")
-            self.logger.info(f"PD Epoch {epoch:3d} | Valid | Loss: {val_metrics['pd_loss']:.6f} | RMSE: {val_metrics['pd_rmse']:.6f} | R²: {val_metrics['pd_r2']:.4f}")
-            
-            # Check for PD best model
-            if val_metrics['pd_rmse'] < self.best_pd_rmse:
-                self.best_pd_rmse = val_metrics['pd_rmse']
-                self._save_best_model()
-                pd_epochs_without_improvement = 0
-                self.logger.info(f"New PD best model - RMSE: {self.best_pd_rmse:.6f}")
-            else:
-                pd_epochs_without_improvement += 1
-            
-            # Early stopping for PD
-            if pd_epochs_without_improvement >= self.config.patience:
-                self.logger.info(f"PD early stopping - Epoch {epoch}")
-                break
-        
-        self.logger.info(f"PD training completed - Best RMSE: {self.best_pd_rmse:.6f}")
-        return {'best_rmse': self.best_pd_rmse, 'epochs_trained': epoch + 1}
-    
-    def _train_epoch(self) -> Dict[str, float]:
-        """Train one epoch"""
-        if self.mode == "separate":
-            return self._train_epoch_separate()
+
+        return {'best_rmse': best_rmse, 'epochs_trained': epoch + 1}
+
+    # =========================
+    # Single task epoch
+    # =========================
+    def _train_single_epoch(self, task: str, loader_key: str, is_training=True) -> Dict[str, float]:
+        if is_training:
+            self.model.train()
         else:
-            return self._train_epoch_standard()
-    
-    def _train_epoch_standard(self) -> Dict[str, float]:
-        """Train one epoch for standard modes (joint, shared, etc.)"""
-        self.model.train()
-        total_loss = 0.0
-        pk_loss = 0.0
-        pd_loss = 0.0
-        num_batches = 0
-        
-        # Metrics accumulation
-        metrics_sum = {
-            'pk_mse': 0.0, 'pk_rmse': 0.0, 'pk_mae': 0.0, 'pk_r2': 0.0,
-            'pd_mse': 0.0, 'pd_rmse': 0.0, 'pd_mae': 0.0, 'pd_r2': 0.0
-        }
-        
-        # Select mode-specific data loaders
-        train_loaders = self._get_train_loaders()
-        pk_loader, pd_loader = train_loaders
-        
-        # Process PK and PD batches independently
-        pk_batches = list(pk_loader)
-        pd_batches = list(pd_loader)
+            self.model.eval()
 
-        pk_predictions = []
-        pk_targets = []
-        # Process all PK batches
-        for batch_pk in pk_batches:
-            self.optimizer.zero_grad()
-            batch_pk = self._to_device(batch_pk)
+        total_loss, preds, targets, num_batches = 0.0, [], [], 0
 
-            loss_dict = self.loss_computation.compute_loss(batch_pk, None, self.mode, is_training=True)
-            loss_dict['total'].backward()
-            self.optimizer.step()
-            
-            total_loss += loss_dict['total'].item()
-            pk_loss += loss_dict.get('pk', 0.0)
-            # Store predictions and targets for R² calculation
-            if isinstance(batch_pk, (list, tuple)):
-                pk_target = batch_pk[1]
-            else:
-                pk_target = batch_pk['y']
-            
-            # Convert batch to proper format
-            if isinstance(batch_pk, (list, tuple)):
-                batch_dict = {'x': batch_pk[0], 'y': batch_pk[1]}
-            else:
-                batch_dict = batch_pk
-            
-            if self.config.use_mc_dropout:
-                pk_results = self.model.predict_with_uncertainty({'pk': batch_dict})
-            else:
-                pk_results = self.model({'pk': batch_dict})
-            pk_pred = pk_results['pk']['pred']
-            pk_predictions.append(pk_pred.detach().cpu())
-            pk_targets.append(pk_target.detach().cpu())
-            
-            num_batches += 1
+        loader = self.data_loaders[loader_key]
+        with torch.set_grad_enabled(is_training):
+            for batch in loader:
+                if is_training:
+                    self.optimizer.zero_grad()
 
-        # Calculate actual metrics
-        pk_mse = pk_loss / num_batches
-        pk_rmse = np.sqrt(pk_mse.item() if hasattr(pk_mse, 'item') else pk_mse)
-        pk_mae = pk_mse  # Approximation
-        
-        # Calculate R² using _reg_metrics from heads.py
-        if pk_predictions and pk_targets:
-            pk_pred_flat = torch.cat(pk_predictions).squeeze()
-            pk_target_flat = torch.cat(pk_targets).squeeze()
-            pk_metrics = _reg_metrics(pk_pred_flat, pk_target_flat)
-            pk_r2 = pk_metrics['r2']
-        else:
-            pk_r2 = 0.0
+                batch = self._to_device(batch)
+                other_batch = None if task == "pk" else batch
+                loss_dict, _, _ = self.loss_computation.compute_loss(
+                    self.model,
+                    batch if task == "pk" else None,
+                    other_batch,
+                    self.mode,
+                    is_training=is_training
+                )
+                if is_training:
+                    loss_dict['total'].backward()
+                    self.optimizer.step()
 
+                total_loss += loss_dict[task].item()
+                batch_dict, target = (
+                    ({"x": batch[0], "y": batch[1]}, batch[1])
+                    if isinstance(batch, (list, tuple)) else (batch, batch['y'])
+                )
 
-        pd_predictions = []
-        pd_targets = []
-
-        # Process all PD batches
-        for batch_pd in pd_batches:
-            self.optimizer.zero_grad()
-            batch_pd = self._to_device(batch_pd)
-            
-            loss_dict = self.loss_computation.compute_loss(None, batch_pd, self.mode, is_training=True)
-            loss_dict['total'].backward()
-            self.optimizer.step()
-        
-            total_loss += loss_dict['total'].item()
-            pd_loss += loss_dict.get('pd', 0.0)
-            # Store predictions and targets for R² calculation
-            if isinstance(batch_pd, (list, tuple)):
-                pd_target = batch_pd[1]
-            else:
-                pd_target = batch_pd['y']
-                
-            # Convert batch to proper format
-            if isinstance(batch_pd, (list, tuple)):
-                batch_dict = {'x': batch_pd[0], 'y': batch_pd[1]}
-            else:
-                batch_dict = batch_pd
-                
-            if self.config.use_mc_dropout:
-                pd_results = self.model.predict_with_uncertainty({'pd': batch_dict})
-            else:
-                pd_results = self.model({'pd': batch_dict}) 
-            pd_pred = pd_results['pd']['pred']
-            pd_predictions.append(pd_pred.detach().cpu())
-            pd_targets.append(pd_target.detach().cpu())
-                
-            num_batches += 1
-                
-        # Calculate actual metrics
-        pd_mse = pd_loss / num_batches
-        pd_rmse = np.sqrt(pd_mse.item() if hasattr(pd_mse, 'item') else pd_mse)
-        pd_mae = pd_mse  # Approximation
-        
-        # Calculate R² using _reg_metrics from heads.py
-        if pd_predictions and pd_targets:
-            pd_pred_flat = torch.cat(pd_predictions).squeeze()
-            pd_target_flat = torch.cat(pd_targets).squeeze()
-            pd_metrics = _reg_metrics(pd_pred_flat, pd_target_flat)
-            pd_r2 = pd_metrics['r2']
-        else:
-            pd_r2 = 0.0
-        # Calculate average
-        result = {
-            'total_loss': total_loss / num_batches,
-            'pk_loss': pk_loss / num_batches,
-            'pd_loss': pd_loss / num_batches,
-            'pk_mse': pk_mse, 'pk_rmse': pk_rmse, 'pk_mae': pk_mae, 'pk_r2': float(pk_r2),
-            'pd_mse': pd_mse, 'pd_rmse': pd_rmse, 'pd_mae': pd_mae, 'pd_r2': float(pd_r2),
-        }
-        
-        return result
-    
-    def _train_epoch_separate(self) -> Dict[str, float]:
-        """Train one epoch for separate mode - PK first, then PD"""
-        self.model.train()
-        total_loss = 0.0
-        pk_loss = 0.0
-        pd_loss = 0.0
-        num_batches = 0
-        
-        # Metrics accumulation
-        metrics_sum = {
-            'pk_mse': 0.0, 'pk_rmse': 0.0, 'pk_mae': 0.0, 'pk_r2': 0.0,
-            'pd_mse': 0.0, 'pd_rmse': 0.0, 'pd_mae': 0.0, 'pd_r2': 0.0
-        }
-        
-
-        # Phase 1: Train PK model
-        self.logger.info("=== Phase 1: Training PK Model ===")
-        pk_batch_count = 0
-        # For R² calculation (using evaluation.py method)
-        pk_predictions = []
-        pk_targets = []
-        
-        for batch_pk in self.data_loaders['train_pk']:
-            self.optimizer.zero_grad()
-            batch_pk = self._to_device(batch_pk)
-            
-            loss_dict = self.loss_computation.compute_loss(batch_pk, None, self.mode, is_training=True)
-            loss_dict['total'].backward()
-            self.optimizer.step()
-        
-            total_loss += loss_dict['total'].item()
-            pk_loss += loss_dict.get('pk', torch.tensor(0.0)).item()
-
-            # Store predictions and targets for R² calculation
-            if isinstance(batch_pk, (list, tuple)):
-                pk_target = batch_pk[1]
-            else:
-                pk_target = batch_pk['y']
-            
-            # Convert batch to proper format
-            if isinstance(batch_pk, (list, tuple)):
-                batch_dict = {'x': batch_pk[0], 'y': batch_pk[1]}
-            else:
-                batch_dict = batch_pk
-            
-            if self.config.use_mc_dropout:
-                pk_results = self.model.predict_with_uncertainty({'pk': batch_dict})
-            else:
-                pk_results = self.model({'pk': batch_dict})
-            pk_pred = pk_results['pk']['pred']
-            pk_predictions.append(pk_pred.detach().cpu())
-            pk_targets.append(pk_target.detach().cpu())
-
-            num_batches += 1
-            pk_batch_count += 1
-        
-        # Calculate actual metrics
-        pk_mse = pk_loss / num_batches
-        pk_rmse = np.sqrt(pk_mse.item() if hasattr(pk_mse, 'item') else pk_mse)
-        pk_mae = pk_mse  # Approximation
-        
-        # Calculate R² using _reg_metrics from heads.py
-        if pk_predictions and pk_targets:
-            pk_pred_flat = torch.cat(pk_predictions).squeeze()
-            pk_target_flat = torch.cat(pk_targets).squeeze()
-            pk_metrics = _reg_metrics(pk_pred_flat, pk_target_flat)
-            pk_r2 = pk_metrics['r2']
-        else:
-            pk_r2 = 0.0
-        
-        self.logger.info(f"PK training completed - Processed {pk_batch_count} batches")
-        
-
-        # For R² calculation (using evaluation.py method)
-        pd_predictions = []
-        pd_targets = []
-        # Phase 2: Train PD model
-        self.logger.info("=== Phase 2: Training PD Model ===")
-        pd_batch_count = 0
-        for batch_pd in self.data_loaders['train_pd']:
-            self.optimizer.zero_grad()
-            batch_pd = self._to_device(batch_pd)
-            
-            if scaler is not None:
-                with torch.cuda.amp.autocast():
-                    loss_dict = self.loss_computation.compute_loss(None, batch_pd, self.mode, is_training=True)
-                scaler.scale(loss_dict['total']).backward()
-                scaler.step(self.optimizer)
-                scaler.update()
-            else:
-                loss_dict = self.loss_computation.compute_loss(None, batch_pd, self.mode, is_training=True)
-                loss_dict['total'].backward()
-                self.optimizer.step()
-            
-            total_loss += loss_dict['total'].item()
-            pd_loss += loss_dict.get('pd', torch.tensor(0.0)).item()
-
-            # Store predictions and targets for R² calculation
-            if isinstance(batch_pd, (list, tuple)):
-                pd_target = batch_pd[1]
-            else:
-                pd_target = batch_pd['y']
-                
-            # Convert batch to proper format
-            if isinstance(batch_pd, (list, tuple)):
-                batch_dict = {'x': batch_pd[0], 'y': batch_pd[1]}
-            else:
-                batch_dict = batch_pd
-                
-            if self.config.use_mc_dropout:
-                pd_results = self.model.predict_with_uncertainty({'pd': batch_dict})
-            else:
-                pd_results = self.model({'pd': batch_dict})
-            pd_pred = pd_results['pd']['pred']
-            pd_predictions.append(pd_pred.detach().cpu())
-            pd_targets.append(pd_target.detach().cpu())
-
-            num_batches += 1
-            pd_batch_count += 1
-        
-        self.logger.info(f"PD training completed - Processed {pd_batch_count} batches")
-        
-        # Calculate actual metrics
-        pd_mse = pd_loss / num_batches
-        pd_rmse = np.sqrt(pd_mse.item() if hasattr(pd_mse, 'item') else pd_mse)
-        pd_mae = pd_mse  # Approximation
-        
-        # Calculate R² using _reg_metrics from heads.py
-        if pd_predictions and pd_targets:
-            pd_pred_flat = torch.cat(pd_predictions).squeeze()
-            pd_target_flat = torch.cat(pd_targets).squeeze()
-            pd_metrics = _reg_metrics(pd_pred_flat, pd_target_flat)
-            pd_r2 = pd_metrics['r2']
-        else:
-            pd_r2 = 0.0
-        
-        # Average metrics
-        avg_metrics = {
-            'total_loss': total_loss / num_batches,
-            'pk_loss': pk_loss / num_batches,
-            'pd_loss': pd_loss / num_batches,
-            'pk_mse': pk_mse, 'pk_rmse': pk_rmse, 'pk_mae': pk_mae, 'pk_r2': float(pk_r2),
-            'pd_mse': pd_mse, 'pd_rmse': pd_rmse, 'pd_mae': pd_mae, 'pd_r2': float(pd_r2),
-        }
-        
-        return avg_metrics
-    
-    def _train_pk_epoch(self) -> Dict[str, float]:
-        """Train one epoch for PK only"""
-        self.model.train()
-        pk_loss = 0.0
-        num_batches = 0
-        
-        # For R² calculation (using evaluation.py method)
-        pk_predictions = []
-        pk_targets = []
-        
-        for batch_pk in self.data_loaders['train_pk']:
-            self.optimizer.zero_grad()
-            batch_pk = self._to_device(batch_pk)
-
-            loss_dict = self.loss_computation.compute_loss(batch_pk, None, self.mode, is_training=True)
-            loss_dict['total'].backward()
-            self.optimizer.step()
-            
-            pk_loss += loss_dict.get('pk', torch.tensor(0.0)).item()
-            
-            # Store predictions and targets for R² calculation
-            if isinstance(batch_pk, (list, tuple)):
-                pk_target = batch_pk[1]
-            else:
-                pk_target = batch_pk['y']
-            
-            # Convert batch to proper format
-            if isinstance(batch_pk, (list, tuple)):
-                batch_dict = {'x': batch_pk[0], 'y': batch_pk[1]}
-            else:
-                batch_dict = batch_pk
-            
-            if self.config.use_mc_dropout:
-                pk_results = self.model.predict_with_uncertainty({'pk': batch_dict})
-            else:
-                pk_results = self.model({'pk': batch_dict})
-            pk_pred = pk_results['pk']['pred']
-            pk_predictions.append(pk_pred.detach().cpu())
-            pk_targets.append(pk_target.detach().cpu())
-            
-            num_batches += 1
-            
-        # Calculate actual metrics
-        pk_mse = pk_loss / num_batches
-        pk_rmse = np.sqrt(pk_mse.item() if hasattr(pk_mse, 'item') else pk_mse)
-        pk_mae = pk_mse  # Approximation
-        
-        # Calculate R² using _reg_metrics from heads.py
-        if pk_predictions and pk_targets:
-            pk_pred_flat = torch.cat(pk_predictions).squeeze()
-            pk_target_flat = torch.cat(pk_targets).squeeze()
-            pk_metrics = _reg_metrics(pk_pred_flat, pk_target_flat)
-            pk_r2 = pk_metrics['r2']
-        else:
-            pk_r2 = 0.0
-        
-        return {
-            'pk_loss': pk_loss / num_batches,
-            'pk_mse': pk_mse, 'pk_rmse': pk_rmse, 'pk_mae': pk_mae, 'pk_r2': float(pk_r2),
-        }
-    
-    def _train_pd_epoch(self) -> Dict[str, float]:
-        """Train one epoch for PD only"""
-        self.model.train()
-        pd_loss = 0.0
-        num_batches = 0
-        
-        # For R² calculation (using evaluation.py method)
-        pd_predictions = []
-        pd_targets = []
-        
-        # Mixed precision settings
-        
-        for batch_pd in self.data_loaders['train_pd']:
-            self.optimizer.zero_grad()
-            batch_pd = self._to_device(batch_pd)
-                
-            loss_dict = self.loss_computation.compute_loss(None, batch_pd, self.mode, is_training=True)
-            loss_dict['total'].backward()
-            self.optimizer.step()
-            
-            pd_loss += loss_dict.get('pd', torch.tensor(0.0)).item()
-            
-            # Store predictions and targets for R² calculation
-            if isinstance(batch_pd, (list, tuple)):
-                pd_target = batch_pd[1]
-            else:
-                pd_target = batch_pd['y']
-                
-            # Convert batch to proper format
-            if isinstance(batch_pd, (list, tuple)):
-                batch_dict = {'x': batch_pd[0], 'y': batch_pd[1]}
-            else:
-                batch_dict = batch_pd
-                
-            if self.config.use_mc_dropout:
-                pd_results = self.model.predict_with_uncertainty({'pd': batch_dict})
-            else:
-                pd_results = self.model({'pd': batch_dict})
-            pd_pred = pd_results['pd']['pred']
-            pd_predictions.append(pd_pred.detach().cpu())
-            pd_targets.append(pd_target.detach().cpu())
-                
-            num_batches += 1
-                
-        # Calculate actual metrics
-        pd_mse = pd_loss / num_batches
-        pd_rmse = np.sqrt(pd_mse.item() if hasattr(pd_mse, 'item') else pd_mse)
-        pd_mae = pd_mse  # Approximation
-        
-        # Calculate R² using _reg_metrics from heads.py
-        if pd_predictions and pd_targets:
-            pd_pred_flat = torch.cat(pd_predictions).squeeze()
-            pd_target_flat = torch.cat(pd_targets).squeeze()
-            pd_metrics = _reg_metrics(pd_pred_flat, pd_target_flat)
-            pd_r2 = pd_metrics['r2']
-        else:
-            pd_r2 = 0.0
-        
-        return {
-            'pd_loss': pd_loss / num_batches,
-            'pd_mse': pd_mse, 'pd_rmse': pd_rmse, 'pd_mae': pd_mae, 'pd_r2': float(pd_r2),
-        }
-    
-    def _validate_epoch(self) -> Dict[str, float]:
-        """Validate one epoch"""
-        if self.mode == "separate":
-            return self._validate_epoch_separate()
-        else:
-            return self._validate_epoch_standard()
-    
-    def _validate_epoch_standard(self) -> Dict[str, float]:
-        """Validate one epoch for standard modes"""
-        self.model.eval()
-        total_loss = 0.0
-        pk_loss = 0.0
-        pd_loss = 0.0
-        num_batches = 0
-        
-        val_loaders = self._get_val_loaders()
-        pk_loader, pd_loader = val_loaders
-        
-        # Process PK and PD batches independently (consistent with training)
-        pk_batches = list(pk_loader)
-        pd_batches = list(pd_loader)
-        
-        pk_predictions = []
-        pk_targets = []
-        pd_predictions = []
-        pd_targets = []
-        
-        with torch.no_grad():
-            # Process PK batches
-            for batch_pk in pk_batches:
-                batch_pk = self._to_device(batch_pk)
-                
-                loss_dict = self.loss_computation.compute_loss(batch_pk, None, self.mode, is_training=True)
-                
-                total_loss += loss_dict['total'].item()
-                pk_loss += loss_dict.get('pk', 0.0)
-                
-                # Store predictions and targets for R² calculation
-                if isinstance(batch_pk, (list, tuple)):
-                    pk_target = batch_pk[1]
-                    batch_dict = {'x': batch_pk[0], 'y': batch_pk[1]}
-                else:
-                    pk_target = batch_pk['y']
-                    batch_dict = batch_pk
-                
                 if self.config.use_mc_dropout:
-                    pk_results = self.model.predict_with_uncertainty({'pk': batch_dict})
+                    results = self.model.predict_with_uncertainty({task: batch_dict})
                 else:
-                    pk_results = self.model({'pk': batch_dict})
-                pk_pred = pk_results['pk']['pred']
-                pk_predictions.append(pk_pred.detach().cpu())
-                pk_targets.append(pk_target.detach().cpu())
-                
+                    results = self.model({task: batch_dict})
+
+                preds.append(results[task]['pred'].detach().cpu())
+                targets.append(target.detach().cpu())
                 num_batches += 1
-            
-            # Process PD batches
-            for batch_pd in pd_batches:
-                batch_pd = self._to_device(batch_pd)
-                
-                loss_dict = self.loss_computation.compute_loss(None, batch_pd, self.mode, is_training=True)
-                
-                total_loss += loss_dict['total'].item()
-                pd_loss += loss_dict.get('pd', 0.0)
-                
-                # Store predictions and targets for R² calculation
-            if isinstance(batch_pd, (list, tuple)):
-                    pd_target = batch_pd[1]
-                    batch_dict = {'x': batch_pd[0], 'y': batch_pd[1]}
-            else:
-                    pd_target = batch_pd['y']
-                    batch_dict = batch_pd
-            
-            if self.config.use_mc_dropout:
-                pd_results = self.model.predict_with_uncertainty({'pd': batch_dict})
-            else:
-                pd_results = self.model({'pd': batch_dict})
-            pd_pred = pd_results['pd']['pred']
-            pd_predictions.append(pd_pred.detach().cpu())
-            pd_targets.append(pd_target.detach().cpu())
-            
-            num_batches += 1
-        
-        # Calculate actual metrics
-        pk_mse = pk_loss / num_batches
-        pd_mse = pd_loss / num_batches
-        
-        # Calculate R² using _reg_metrics from heads.py
-        if pk_predictions and pk_targets:
-            pk_pred_flat = torch.cat(pk_predictions).squeeze()
-            pk_target_flat = torch.cat(pk_targets).squeeze()
-            pk_metrics = _reg_metrics(pk_pred_flat, pk_target_flat)
-            pk_r2 = pk_metrics['r2']
-        else:
-            pk_r2 = 0.0
-            
-        if pd_predictions and pd_targets:
-            pd_pred_flat = torch.cat(pd_predictions).squeeze()
-            pd_target_flat = torch.cat(pd_targets).squeeze()
-            pd_metrics = _reg_metrics(pd_pred_flat, pd_target_flat)
-            pd_r2 = pd_metrics['r2']
-        else:
-            pd_r2 = 0.0
-                
+
+        metrics = _reg_metrics(torch.cat(preds).squeeze(), torch.cat(targets).squeeze())
         return {
-            'total_loss': total_loss / num_batches,
-            'pk_loss': pk_loss / num_batches,
-            'pd_loss': pd_loss / num_batches,
-            'pk_mse': pk_mse, 'pk_rmse': np.sqrt(pk_mse.item() if hasattr(pk_mse, 'item') else pk_mse), 'pk_mae': pk_mse, 'pk_r2': float(pk_r2),
-            'pd_mse': pd_mse, 'pd_rmse': np.sqrt(pd_mse.item() if hasattr(pd_mse, 'item') else pd_mse), 'pd_mae': pd_mse, 'pd_r2': float(pd_r2),
+            f"{task}_loss": total_loss / num_batches,
+            **{f"{task}_{k}": float(v) for k, v in metrics.items()}
         }
-        
-    def _validate_epoch_separate(self) -> Dict[str, float]:
-        """Validate one epoch for separate mode - PK and PD separately"""
-        self.model.eval()
-        total_loss = 0.0
-        pk_loss = 0.0
-        pd_loss = 0.0
-        num_batches = 0
-        
-        with torch.no_grad():
-            # Validate PK model
-            for batch_pk in self.data_loaders['val_pk']:
-                batch_pk = self._to_device(batch_pk)
-                loss_dict = self.loss_computation.compute_loss(batch_pk, None, self.mode, is_training=False)
-                
-                total_loss += loss_dict['total'].item()
-                pk_loss += loss_dict.get('pk', torch.tensor(0.0)).item()
-                num_batches += 1
-            
-            # Validate PD model
-            for batch_pd in self.data_loaders['val_pd']:
-                batch_pd = self._to_device(batch_pd)
-                loss_dict = self.loss_computation.compute_loss(None, batch_pd, self.mode, is_training=False)
-                
-                total_loss += loss_dict['total'].item()
-                pd_loss += loss_dict.get('pd', torch.tensor(0.0)).item()
-            num_batches += 1
-        
-        # Calculate basic metrics
-        pk_mse = pk_loss / num_batches
-        pd_mse = pd_loss / num_batches
-        
-        return {
-            'total_loss': total_loss / num_batches,
-            'pk_loss': pk_loss / num_batches,
-            'pd_loss': pd_loss / num_batches,
-            'pk_mse': pk_mse, 'pk_rmse': np.sqrt(pk_mse), 'pk_mae': pk_mse, 'pk_r2': 0.0,
-            'pd_mse': pd_mse, 'pd_rmse': np.sqrt(pd_mse), 'pd_mae': pd_mse, 'pd_r2': 0.0,
-        }
-    
-    def _validate_pk_epoch(self) -> Dict[str, float]:
-        """Validate one epoch for PK only"""
-        self.model.eval()
-        pk_loss = 0.0
-        num_batches = 0
-        # For R² calculation (using evaluation.py method)
-        pk_predictions = []
-        pk_targets = []
-        with torch.no_grad():
-            for batch_pk in self.data_loaders['val_pk']:
-                batch_pk = self._to_device(batch_pk)
-                loss_dict = self.loss_computation.compute_loss(batch_pk, None, self.mode, is_training=False)
-                
-                pk_loss += loss_dict.get('pk', torch.tensor(0.0)).item()
-                # Store predictions and targets for R² calculation
-            if isinstance(batch_pk, (list, tuple)):
-                    pk_target = batch_pk[1]
-            else:
-                    pk_target = batch_pk['y']
-                
-                # Convert batch to proper format
-            if isinstance(batch_pk, (list, tuple)):
-                batch_dict = {'x': batch_pk[0], 'y': batch_pk[1]}
-            else:
-                batch_dict = batch_pk
-            
-            if self.config.use_mc_dropout:
-                pk_results = self.model.predict_with_uncertainty({'pk': batch_dict})
-            else:
-                pk_results = self.model({'pk': batch_dict})
-            pk_pred = pk_results['pk']['pred']
-            pk_predictions.append(pk_pred.detach().cpu())
-            pk_targets.append(pk_target.detach().cpu())
-            
-            num_batches += 1
-        
-        # Calculate actual metrics
-        pk_mse = pk_loss / num_batches
-        pk_rmse = np.sqrt(pk_mse.item() if hasattr(pk_mse, 'item') else pk_mse)
-        pk_mae = pk_mse  # Approximation
-        # Calculate R² using _reg_metrics from heads.py
-        if pk_predictions and pk_targets:
-            pk_pred_flat = torch.cat(pk_predictions).squeeze()
-            pk_target_flat = torch.cat(pk_targets).squeeze()
-            pk_metrics = _reg_metrics(pk_pred_flat, pk_target_flat)
-            pk_r2 = pk_metrics['r2']
-        else:
-            pk_r2 = 0.0      
-        return {
-            'pk_loss': pk_loss / num_batches,
-            'pk_mse': pk_mse, 'pk_rmse': pk_rmse, 'pk_mae': pk_mae, 'pk_r2': pk_r2,
-        }
-    
-    def _validate_pd_epoch(self) -> Dict[str, float]:
-        """Validate one epoch for PD only"""
-        self.model.eval()
-        pd_loss = 0.0
-        num_batches = 0
-        # For R² calculation (using evaluation.py method)
-        pd_predictions = []
-        pd_targets = []
-        
-        with torch.no_grad():
-            for batch_pd in self.data_loaders['val_pd']:
-                batch_pd = self._to_device(batch_pd)
-                loss_dict = self.loss_computation.compute_loss(None, batch_pd, self.mode, is_training=False)
-                
-                pd_loss += loss_dict.get('pd', torch.tensor(0.0)).item()
-                # Store predictions and targets for R² calculation
-            if isinstance(batch_pd, (list, tuple)):
-                pd_target = batch_pd[1]
-            else:
-                pd_target = batch_pd['y']
-                    
-                # Convert batch to proper format
-            if isinstance(batch_pd, (list, tuple)):
-                    batch_dict = {'x': batch_pd[0], 'y': batch_pd[1]}
-            else:
-                    batch_dict = batch_pd
-            
-            if self.config.use_mc_dropout:
-                pd_results = self.model.predict_with_uncertainty({'pd': batch_dict})
-            else:
-                pd_results = self.model({'pd': batch_dict})
-            pd_pred = pd_results['pd']['pred']
-            pd_predictions.append(pd_pred.detach().cpu())
-            pd_targets.append(pd_target.detach().cpu())
-                
-            num_batches += 1
-        
-        # Calculate actual metrics
-        pd_mse = pd_loss / num_batches
-        pd_rmse = np.sqrt(pd_mse.item() if hasattr(pd_mse, 'item') else pd_mse)
-        pd_mae = pd_mse  # Approximation
-        
-        # Calculate R² using _reg_metrics from heads.py
-        if pd_predictions and pd_targets:
-            pd_pred_flat = torch.cat(pd_predictions).squeeze()
-            pd_target_flat = torch.cat(pd_targets).squeeze()
-            pd_metrics = _reg_metrics(pd_pred_flat, pd_target_flat)
-            pd_r2 = pd_metrics['r2']
-        else:
-            pd_r2 = 0.0        
-        return {
-            'pd_loss': pd_loss / num_batches,
-            'pd_mse': pd_mse, 'pd_rmse': pd_rmse, 'pd_mae': pd_mae, 'pd_r2': pd_r2,
-        }
-    
-    def _get_train_loaders(self) -> List[Any]:
-            return [self.data_loaders['train_pk'], self.data_loaders['train_pd']]
-    
-    def _get_val_loaders(self) -> List[Any]:
-            return [self.data_loaders['val_pk'], self.data_loaders['val_pd']]
-    
-    def _to_device(self, batch: Dict[str, Any]) -> Dict[str, Any]:
-        """Move batch to device"""
-        if isinstance(batch, dict):
-            return {k: v.to(self.device) if torch.is_tensor(v) else v for k, v in batch.items()}
-        elif isinstance(batch, (list, tuple)):
-            return [v.to(self.device) if torch.is_tensor(v) else v for v in batch]
-        else:
+
+    # =========================
+    # Standard joint training epoch
+    # =========================
+    def _train_epoch_standard(self) -> Dict[str, float]:
+        results = {}
+        for task, loader_key in [("pk", "train_pk"), ("pd", "train_pd")]:
+            task_metrics = self._train_single_epoch(task, loader_key, is_training=True)
+            results.update(task_metrics)
+
+        results['total_loss'] = results['pk_loss'] + results['pd_loss']
+        return results
+
+    def _validate_epoch_standard(self, loaders: List[Any]) -> Dict[str, float]:
+        results = {}
+        for task, loader_key in [("pk", "val_pk"), ("pd", "val_pd")]:
+            task_metrics = self._train_single_epoch(task, loader_key, is_training=False)
+            results.update(task_metrics)
+
+        results['total_loss'] = results['pk_loss'] + results['pd_loss']
+        return results
+
+    # =========================
+    # Utilities
+    # =========================
+    def _get_train_loaders(self):
+        return [self.data_loaders['train_pk'], self.data_loaders['train_pd']]
+
+    def _get_val_loaders(self):
+        return [self.data_loaders['val_pk'], self.data_loaders['val_pd']]
+
+    def _get_test_loaders(self):
+        return [self.data_loaders['test_pk'], self.data_loaders['test_pd']]
+
+    def _to_device(self, batch):
+        if torch.is_tensor(batch):
             return batch.to(self.device)
-    
+        elif isinstance(batch, dict):
+            return {k: self._to_device(v) for k, v in batch.items()}
+        elif isinstance(batch, (list, tuple)):
+            return type(batch)(self._to_device(v) for v in batch)
+        return batch
+
     def _log_metrics(self, epoch: int, train_metrics: Dict[str, float], val_metrics: Dict[str, float]):
-        """Log metrics"""
-        # Loss history recording
-        self.training_history['train_loss'].append(train_metrics['total_loss'])
-        self.training_history['val_loss'].append(val_metrics['total_loss'])
-        self.training_history['pk_train_loss'].append(train_metrics.get('pk_loss', 0.0))
-        self.training_history['pd_train_loss'].append(train_metrics.get('pd_loss', 0.0))
-        self.training_history['pk_val_loss'].append(val_metrics.get('pk_loss', 0.0))
-        self.training_history['pd_val_loss'].append(val_metrics.get('pd_loss', 0.0))
-        
-        # Log output
+        for k, v in train_metrics.items():
+            self.training_history[f"train_{k}"].append(v)
+        for k, v in val_metrics.items():
+            self.training_history[f"val_{k}"].append(v)
+
         self.logger.info(
-            f"Epoch {epoch:4d} | Train |"
-            f"Loss: {train_metrics['total_loss']:.6f} | "
-            f"PK RMSE: {train_metrics.get('pk_rmse', 0.0):.6f} | "
-            f"PD RMSE: {train_metrics.get('pd_rmse', 0.0):.6f}"
+            f"Epoch {epoch:4d} | Train | Loss: {train_metrics['total_loss']:.6f} "
+            f"| PK RMSE: {train_metrics.get('pk_rmse', 0.0):.6f} "
+            f"| PD RMSE: {train_metrics.get('pd_rmse', 0.0):.6f}"
         )
         self.logger.info(
-            f"Epoch {epoch:4d} | Valid |"
-            f"Loss: {val_metrics['total_loss']:.6f} | "
-            f"PK RMSE: {val_metrics.get('pk_rmse', 0.0):.6f} | "
-            f"PD RMSE: {val_metrics.get('pd_rmse', 0.0):.6f}"
+            f"Epoch {epoch:4d} | Valid | Loss: {val_metrics['total_loss']:.6f} "
+            f"| PK RMSE: {val_metrics.get('pk_rmse', 0.0):.6f} "
+            f"| PD RMSE: {val_metrics.get('pd_rmse', 0.0):.6f}"
         )
-    
+
     def _check_early_stopping(self, val_loss: float) -> bool:
-        """Check early stopping"""
-        if val_loss < self.best_val_loss:
+        if val_loss + 1e-5 < self.best_val_loss:
             self.patience_counter = 0
+            self.best_val_loss = val_loss
             return False
         else:
             self.patience_counter += 1
             return self.patience_counter >= self.config.patience
-    
+
     def _should_save_model(self, val_metrics: Dict[str, float]) -> bool:
-        """Check if model should be saved"""
         should_save = False
-        
-        if self.mode == "separate":
-            # Separate mode: PK and PD each independently select best model
-            if val_metrics.get('pk_rmse', float('inf')) < self.best_pk_rmse:
-                self.best_pk_rmse = val_metrics.get('pk_rmse', float('inf'))
-                should_save = True
-                self.logger.info(f"New PK best model - RMSE: {self.best_pk_rmse:.6f}")
-            
-            if val_metrics.get('pd_rmse', float('inf')) < self.best_pd_rmse:
-                self.best_pd_rmse = val_metrics.get('pd_rmse', float('inf'))
-                should_save = True
-                self.logger.info(f"New PD best model - RMSE: {self.best_pd_rmse:.6f}")
-        else:
-            # Other modes: PD RMSE selects best model, but also track PK RMSE
-            if val_metrics.get('pd_rmse', float('inf')) < self.best_pd_rmse:
-                self.best_pd_rmse = val_metrics.get('pd_rmse', float('inf'))
-                self.best_pk_rmse = val_metrics.get('pk_rmse', float('inf'))
-                should_save = True
-                self.logger.info(f"New PD best model - RMSE: {self.best_pd_rmse:.6f}")
-                self.logger.info(f"New PK best model - RMSE: {self.best_pk_rmse:.6f}")
-        
-        # Maintain existing total_loss criterion (for compatibility)
-        if val_metrics['total_loss'] < self.best_val_loss:
-            self.best_val_loss = val_metrics['total_loss']
-            if not should_save:  # If not already saved
-                should_save = True
-        
+        if val_metrics['pd_rmse'] < self.best_pd_rmse:
+            self.best_pd_rmse = val_metrics['pd_rmse']
+            self.best_pk_rmse = val_metrics['pk_rmse']
+            should_save = True
         return should_save
-    
+
     def _save_best_model(self):
-        """Save best model"""
-        # Ensure directory exists
         self.model_save_directory.mkdir(parents=True, exist_ok=True)
-        
         model_path = self.model_save_directory / "best_model.pth"
         torch.save({
             'model_state_dict': self.model.state_dict(),
@@ -1048,49 +354,215 @@ class UnifiedPKPDTrainer:
             'val_loss': self.best_val_loss,
             'config': self.config
         }, model_path)
-    
+
     def save_model(self, filename: str):
-        """Save model"""
-        # Ensure directory exists
         self.model_save_directory.mkdir(parents=True, exist_ok=True)
-        
         model_path = self.model_save_directory / filename
-        
-        # Create a copy of the model without batch_input functions for saving
-        import copy
+
         model_for_saving = copy.deepcopy(self.model)
-        
-        # Remove batch_input functions that can't be pickled
+
         def remove_batch_input_functions(module):
-            for name, child in module.named_children():
+            for _, child in module.named_children():
                 if hasattr(child, 'batched_qnode'):
                     child.batched_qnode = None
                 remove_batch_input_functions(child)
-        
+
         remove_batch_input_functions(model_for_saving)
-        
+
         torch.save({
             'model_state_dict': self.model.state_dict(),
-            'model': model_for_saving,  # Clean model object for saving
+            'model': model_for_saving,
             'optimizer_state_dict': self.optimizer.state_dict(),
             'epoch': self.epoch,
             'val_loss': self.best_val_loss,
             'config': self.config,
-            'training_history': self.training_history
+            'training_history': dict(self.training_history)
         }, model_path)
         self.logger.info(f"Model saved: {model_path}")
-    
+
     def _get_final_results(self) -> Dict[str, Any]:
-        """Return final results including test metrics"""
-        # Evaluate test set
-        test_metrics = self.evaluator.evaluate_test_set(self.data_loaders, self.mode)
-        
+        self.logger.info("Evaluating on test set...")
+        test_metrics = self._validate_epoch_standard(self._get_test_loaders())
         return {
             'best_val_loss': self.best_val_loss,
             'best_pk_rmse': self.best_pk_rmse,
             'best_pd_rmse': self.best_pd_rmse,
             'final_epoch': self.epoch,
-            'training_history': self.training_history,
+            'training_history': dict(self.training_history),
             'model_info': self.model.get_model_info(),
             'test_metrics': test_metrics
+        }
+
+
+    # =========================
+    # Classification fine-tuning
+    # =========================
+    def train_clf(self, freeze_encoder: bool = True) -> Dict[str, Any]:
+        """
+        Fine-tune classification head only (encoder frozen).
+        Requires train_pd / val_pd / test_pd dataloaders to return (x, y_reg, y_clf) or dict with keys.
+        """
+        self.logger.info("=== Starting classification fine-tuning ===")
+
+        # 1. Freeze encoder
+        if freeze_encoder:
+            for enc_name in ["pk_encoder", "pd_encoder", "encoder"]:
+                if hasattr(self.model, enc_name):
+                    for p in getattr(self.model, enc_name).parameters():
+                        p.requires_grad = False
+            self.logger.info("Encoders frozen. Only head_clf will be trained.")
+
+        # 2. Optimizer only for classification head
+        self.optimizer = torch.optim.Adam(
+            self.model.head_clf.parameters(),
+            lr=getattr(self.config, "clf_lr", 1e-3)
+        )
+
+        # 3. Loss function
+        criterion = torch.nn.CrossEntropyLoss()
+
+        # 4. Training state
+        best_val_loss = float("inf")
+        best_val_metrics = {}
+        history = {"train_loss": [], "val_loss": [], "val_metrics": []}
+        patience = getattr(self.config, "clf_patience", 5)
+        no_improve = 0
+
+        # 5. Training loop
+        for epoch in range(getattr(self.config, "clf_epochs", 10)):
+            # -------- Training --------
+            self.model.train()
+            train_losses = []
+
+            for batch in self.data_loaders["train_pd"]:
+                batch = self._to_device(batch)
+
+                if isinstance(batch, (list, tuple)) and len(batch) == 3:
+                    x, y_reg, y_clf = batch
+                elif isinstance(batch, dict):
+                    x, y_reg, y_clf = batch["x"], batch.get("y"), batch["y_clf"]
+                else:
+                    raise ValueError("Unsupported batch format for classification")
+
+                self.optimizer.zero_grad()
+                outputs = self.model._forward_clf({"pd": {"x": x, "y": y_reg}})
+                logits = outputs["pd"]["pred"]
+
+                loss = criterion(logits, y_clf)
+                loss.backward()
+                self.optimizer.step()
+                train_losses.append(loss.item())
+
+            avg_train_loss = float(np.mean(train_losses))
+            history["train_loss"].append(avg_train_loss)
+
+            # -------- Validation --------
+            self.model.eval()
+            val_losses, all_preds, all_targets = [], [], []
+            with torch.no_grad():
+                for batch in self.data_loaders["val_pd"]:
+                    batch = self._to_device(batch)
+
+                    if isinstance(batch, (list, tuple)) and len(batch) == 3:
+                        x, y_reg, y_clf = batch
+                    elif isinstance(batch, dict):
+                        x, y_reg, y_clf = batch["x"], batch.get("y"), batch["y_clf"]
+                    else:
+                        raise ValueError("Unsupported batch format for classification")
+
+                    outputs = self.model._forward_clf({"pd": {"x": x, "y": y_reg}})
+                    logits = outputs["pd"]["pred"]
+
+                    loss = criterion(logits, y_clf)
+                    val_losses.append(loss.item())
+
+                    preds = torch.argmax(logits, dim=1).cpu().numpy()
+                    all_preds.extend(preds)
+                    all_targets.extend(y_clf.cpu().numpy())
+
+            avg_val_loss = float(np.mean(val_losses)) if len(val_losses) > 0 else float("inf")
+
+            if len(all_targets) > 0:
+                acc = accuracy_score(all_targets, all_preds)
+                f1 = f1_score(all_targets, all_preds, average="weighted")
+                prec = precision_score(all_targets, all_preds, average="weighted", zero_division=0)
+                rec = recall_score(all_targets, all_preds, average="weighted")
+            else:
+                acc = f1 = prec = rec = 0.0
+
+            metrics = {"acc": acc, "f1": f1, "precision": prec, "recall": rec}
+            history["val_loss"].append(avg_val_loss)
+            history["val_metrics"].append(metrics)
+
+            self.logger.info(
+                f"[Clf Fine-tune][Epoch {epoch+1}] "
+                f"Train loss: {avg_train_loss:.4f} | "
+                f"Val loss: {avg_val_loss:.4f} | "
+                f"Acc: {acc:.4f} | F1: {f1:.4f}"
+            )
+
+            # -------- Early stopping & model save --------
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                best_val_metrics = metrics
+                model_path = self.model_save_directory / "best_model_clf.pth"
+                torch.save(self.model.state_dict(), model_path)
+                self.logger.info(f"✅ Best classification model saved at {model_path}")
+                no_improve = 0
+            else:
+                no_improve += 1
+
+            if no_improve >= patience:
+                self.logger.info(f"Early stopping at epoch {epoch+1}")
+                break
+
+        # 6. Test evaluation (after best model is chosen)
+        self.logger.info("=== Evaluating classification on test set ===")
+        self.model.eval()
+        test_losses, test_preds, test_targets = [], [], []
+        with torch.no_grad():
+            for batch in self.data_loaders["test_pd"]:
+                batch = self._to_device(batch)
+
+                if isinstance(batch, (list, tuple)) and len(batch) == 3:
+                    x, y_reg, y_clf = batch
+                elif isinstance(batch, dict):
+                    x, y_reg, y_clf = batch["x"], batch.get("y"), batch["y_clf"]
+                else:
+                    raise ValueError("Unsupported batch format for classification")
+
+                outputs = self.model._forward_clf({"pd": {"x": x, "y": y_reg}})
+                logits = outputs["pd"]["pred"]
+
+                loss = criterion(logits, y_clf)
+                test_losses.append(loss.item())
+
+                preds = torch.argmax(logits, dim=1).cpu().numpy()
+                test_preds.extend(preds)
+                test_targets.extend(y_clf.cpu().numpy())
+
+        avg_test_loss = float(np.mean(test_losses)) if len(test_losses) > 0 else float("inf")
+        test_acc = accuracy_score(test_targets, test_preds)
+        test_f1 = f1_score(test_targets, test_preds, average="weighted")
+        test_prec = precision_score(test_targets, test_preds, average="weighted", zero_division=0)
+        test_rec = recall_score(test_targets, test_preds, average="weighted")
+
+        test_metrics = {
+            "test_loss": avg_test_loss,
+            "acc": test_acc,
+            "f1": test_f1,
+            "precision": test_prec,
+            "recall": test_rec,
+        }
+
+        self.logger.info(
+            f"[Clf Test] Loss: {avg_test_loss:.4f} | "
+            f"Acc: {test_acc:.4f} | F1: {test_f1:.4f}"
+        )
+
+        return {
+            "best_val_loss": best_val_loss,
+            "best_val_metrics": best_val_metrics,
+            "history": history,
+            "test_metrics": test_metrics,
         }

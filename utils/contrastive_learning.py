@@ -34,7 +34,7 @@ class PKPDContrastiveLearning:
         """
         if self.aug_method is None:
             # Default to random augmentation
-            x_aug, _ = self.augmentation.random_augmentation(x, torch.zeros(x.size(0), device=x.device))
+            x_aug, _ = self.augmentation._apply_random_augmentation(x, torch.zeros(x.size(0), device=x.device))
         else:
             # Use specified augmentation method
             x_aug, _ = self.augmentation.apply_augmentation(x, torch.zeros(x.size(0), device=x.device))
